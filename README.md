@@ -1,5 +1,7 @@
 # LoRa Messenger
 
+> **AI-Assisted Development** — This firmware was developed with the assistance of large language models (Claude, Cline) as a collaborative coding tool. The human author (kb1isz) directed the architecture, reviewed all changes, and made final decisions.
+
 Custom firmware for LilyGO T-Deck and Heltec WiFi LoRa 32 V3 boards with direct LoRa text messaging, mesh routing, and ACK-based reliable delivery.
 
 ## What It Does
