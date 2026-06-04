@@ -15,8 +15,8 @@
 // inject packets into the mesh. For production use, implement BLE pairing
 // with LE Secure Connections and authenticated writes (NIMBLE_PROPERTY::WRITE_AUTHEN).
 //
-// BLE mesh is disabled by default (ENABLE_BLE_MESH=0 in platformio.ini).
-// When disabled, all BLE functions are no-ops to reduce power consumption.
+// BLE mesh is enabled by default (ENABLE_BLE_MESH=1 in platformio.ini).
+// When disabled via platformio.ini, all BLE functions are no-ops to reduce power consumption.
 // ============================================================================
 
 #include "globals.h"
@@ -106,6 +106,11 @@ static bool establishLink(BleLink &link, uint32_t nodeId, const String &addr, ui
     return false;
   }
 
+  // Allow service discovery to propagate before querying.
+  // getService() without the blocking flag may return nullptr if NimBLE
+  // hasn't finished the attribute protocol exchange yet.
+  vTaskDelay(pdMS_TO_TICKS(50));
+
   // Get the remote service and mesh packet characteristic
   NimBLERemoteService *service = client->getService(NimBLEUUID(BLE_MESH_SERVICE_UUID));
   if (service == nullptr) {
@@ -135,42 +140,6 @@ static bool establishLink(BleLink &link, uint32_t nodeId, const String &addr, ui
   link.addressType = addrType;
   bleLinkCount++;
   return true;
-}
-
-// Ensure a persistent BLE link exists to the given node.
-// If a link already exists, updates the lastSeenAt timestamp.
-// If no link exists and the pool has room, attempts to establish one.
-// Returns the link pointer on success, nullptr on failure.
-static BleLink *ensureBleLink(uint32_t nodeId, const String &addr, uint8_t addrType) {
-  if (nodeId == 0 || nodeId == localNodeId) return nullptr;
-  if (addr.length() == 0) return nullptr;
-
-  // Check if we already have a link
-  BleLink *existing = findLinkByNodeId(nodeId);
-  if (existing != nullptr) {
-    existing->lastSeenAt = millis();
-    return existing;
-  }
-
-  // If an idle link slot is available, also remove stale nodes from the
-  // pool to make room for a fresh connection we really care about.
-  // Find or make room for a new link
-  BleLink *slot = findEmptyLinkSlot();
-  if (slot == nullptr) {
-    // Pool full — evict the least recently used link (oldest lastActivityAt)
-    BleLink *oldest = &bleLinks[0];
-    for (auto &link : bleLinks) {
-      if (link.lastActivityAt < oldest->lastActivityAt) oldest = &link;
-    }
-    slot = oldest;
-    teardownLink(*slot);
-  }
-
-  if (establishLink(*slot, nodeId, addr, addrType)) {
-    bleLine = "BLE link " + nodeIdHex(nodeId).substring(4);
-    return slot;
-  }
-  return nullptr;
 }
 
 // ============================================================================
@@ -548,13 +517,9 @@ void processBleTxJob(const BleTxJob &job) {
   if (!job.active) return;
 
   if (job.target != BROADCAST_NODE) {
-    // Try persistent link first
-    BleLink *link = findLinkByNodeId(job.target);
-    if (link != nullptr) {
-      if (sendOverLink(*link, job.encoded, job.len)) return;
-      // Link failed — teardown and fall through to blocking
-      teardownLink(*link);
-    }
+    // sendBlePacketToBlocking tries persistent link first then falls
+    // back to blocking connect→write→disconnect. This avoids duplicating
+    // the link check logic here.
     sendBlePacketToBlocking(job.target, job.encoded, job.len);
     return;
   }
@@ -563,11 +528,7 @@ void processBleTxJob(const BleTxJob &job) {
   const uint32_t now = millis();
   for (const auto &node : bleNodes) {
     if (!node.active || node.address.length() == 0 || now - node.lastSeenAt > BLE_NODE_TTL_MS) continue;
-    BleLink *link = findLinkByNodeId(node.nodeId);
-    if (link != nullptr) {
-      if (sendOverLink(*link, job.encoded, job.len)) continue;
-      teardownLink(*link);
-    }
+    // sendBlePacketToBlocking handles persistent link first, then fallback
     sendBlePacketToBlocking(node.nodeId, job.encoded, job.len);
     vTaskDelay(pdMS_TO_TICKS(BLE_TX_SETTLE_MS));
   }
