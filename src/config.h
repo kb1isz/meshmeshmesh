@@ -246,6 +246,23 @@ constexpr size_t MAX_PACKET_LEN = HEADER_LEN + MAX_BODY_LEN + 2;  // 26 + 152 + 
 constexpr uint32_t BROADCAST_NODE = 0;
 
 // ============================================================================
+//  BLE Mesh constants
+// ============================================================================
+
+// Maximum number of persistent outbound BLE links to maintain concurrently.
+// Each link holds a NimBLEClient connection. ESP32 can typically handle 4-6.
+constexpr uint8_t BLE_LINK_POOL_SIZE = 4;
+
+// Active BLE link idle timeout — disconnect if no traffic for this duration.
+constexpr uint32_t BLE_LINK_IDLE_TIMEOUT_MS = 30000;
+
+// Interval between BLE link keepalive checks.
+constexpr uint32_t BLE_LINK_SERVICE_INTERVAL_MS = 2000;
+
+// Time between reconnect attempts for a dropped BLE link.
+constexpr uint32_t BLE_LINK_RECONNECT_INTERVAL_MS = 15000;
+
+// ============================================================================
 //  Timing constants (milliseconds)
 // ============================================================================
 
@@ -526,6 +543,22 @@ struct BleNode {
   uint32_t lastSeenAt = 0;
   String name;
   String address;  // BLE MAC address string
+};
+
+// Persistent outbound BLE link to a peer mesh node.
+// Unlike BleNode (which is just a scan record), a BleLink holds an
+// active NimBLEClient connection that is kept alive for low-latency
+// packet exchange.
+struct BleLink {
+  bool active = false;
+  uint32_t nodeId = 0;
+  NimBLEClient *client = nullptr;
+  NimBLERemoteCharacteristic *txChar = nullptr;  // peer's mesh packet characteristic
+  uint32_t connectedAt = 0;                      // when the connection was established
+  uint32_t lastActivityAt = 0;                   // last TX or RX over this link
+  uint32_t lastSeenAt = 0;                       // last confirmed peer was alive
+  String address;                                // BLE MAC address string
+  uint8_t addressType = 0;
 };
 
 // Fragment reassembly state for multi-packet messages.

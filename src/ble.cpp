@@ -1,12 +1,13 @@
 // ============================================================================
-// ble.cpp — BLE mesh transport: advertising, scanning, and packet exchange
+// ble.cpp — BLE mesh transport: persistent links, scanning, and packet exchange
 //
 // Implements:
 //  - BLE GATT service for mesh packet relay (when ENABLE_BLE_MESH=1)
 //  - Manufacturer advertisement beacon with node ID and name
 //  - Periodic scanning for nearby T-Deck mesh nodes
-//  - BLE node tracking (RSSI, address, TTL-based expiry)
-//  - BLE transmit queue with blocking send to individual nodes
+//  - Persistent BLE connection pool (BleLink) for low-latency multi-hop mesh
+//  - BLE link keepalive, idle timeout, and automatic reconnect
+//  - BLE transmit queue with send over links or fallback to connect→write→disconnect
 //
 // SECURITY NOTE: When BLE is enabled, the mesh packet GATT characteristic
 // accepts unauthenticated writes from any BLE device. No pairing, bonding,
@@ -45,6 +46,137 @@ class MeshPacketCallbacks : public NimBLECharacteristicCallbacks {
 };
 } // namespace
 
+// ============================================================================
+//  BLE Link Pool (persistent connections to peer mesh nodes)
+// ============================================================================
+
+// Find a link slot by node ID. Returns nullptr if not found.
+static BleLink *findLinkByNodeId(uint32_t nodeId) {
+  for (auto &link : bleLinks)
+    if (link.active && link.nodeId == nodeId) return &link;
+  return nullptr;
+}
+
+// Find a link slot by BLE address string. Returns nullptr if not found.
+static BleLink *findLinkByAddress(const String &addr) {
+  for (auto &link : bleLinks)
+    if (link.active && link.address.equalsIgnoreCase(addr)) return &link;
+  return nullptr;
+}
+
+// Find an empty (inactive) link slot. Returns nullptr if pool is full.
+static BleLink *findEmptyLinkSlot() {
+  for (auto &link : bleLinks)
+    if (!link.active) return &link;
+  return nullptr;
+}
+
+// Disconnect and free a BLE link slot gracefully.
+static void teardownLink(BleLink &link) {
+  if (link.client != nullptr) {
+    if (link.client->isConnected()) {
+      link.client->disconnect();
+      vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    NimBLEDevice::deleteClient(link.client);
+    link.client = nullptr;
+  }
+  link.txChar = nullptr;
+  link.active = false;
+  link.nodeId = 0;
+  link.address = "";
+  link.connectedAt = 0;
+  link.lastActivityAt = 0;
+  link.lastSeenAt = 0;
+  if (bleLinkCount > 0) bleLinkCount--;
+}
+
+// Connect to a peer mesh node and establish a persistent BLE link.
+// Places the connected link into the pool on success.
+// Returns true if the link was established.
+static bool establishLink(BleLink &link, uint32_t nodeId, const String &addr, uint8_t addrType) {
+  NimBLEClient *client = NimBLEDevice::createClient();
+  if (client == nullptr) return false;
+
+  client->setConnectTimeout(BLE_CONNECT_TIMEOUT_MS);
+
+  if (!client->connect(NimBLEAddress(std::string(addr.c_str()), addrType), true, false, false)) {
+    NimBLEDevice::deleteClient(client);
+    packetStats.bleConnectFail++;
+    return false;
+  }
+
+  // Get the remote service and mesh packet characteristic
+  NimBLERemoteService *service = client->getService(NimBLEUUID(BLE_MESH_SERVICE_UUID));
+  if (service == nullptr) {
+    client->disconnect();
+    NimBLEDevice::deleteClient(client);
+    packetStats.bleConnectFail++;
+    return false;
+  }
+
+  NimBLERemoteCharacteristic *txChar = service->getCharacteristic(NimBLEUUID(BLE_MESH_PACKET_UUID));
+  if (txChar == nullptr) {
+    client->disconnect();
+    NimBLEDevice::deleteClient(client);
+    packetStats.bleConnectFail++;
+    return false;
+  }
+
+  const uint32_t now = millis();
+  link.active = true;
+  link.nodeId = nodeId;
+  link.client = client;
+  link.txChar = txChar;
+  link.connectedAt = now;
+  link.lastActivityAt = now;
+  link.lastSeenAt = now;
+  link.address = addr;
+  link.addressType = addrType;
+  bleLinkCount++;
+  return true;
+}
+
+// Ensure a persistent BLE link exists to the given node.
+// If a link already exists, updates the lastSeenAt timestamp.
+// If no link exists and the pool has room, attempts to establish one.
+// Returns the link pointer on success, nullptr on failure.
+static BleLink *ensureBleLink(uint32_t nodeId, const String &addr, uint8_t addrType) {
+  if (nodeId == 0 || nodeId == localNodeId) return nullptr;
+  if (addr.length() == 0) return nullptr;
+
+  // Check if we already have a link
+  BleLink *existing = findLinkByNodeId(nodeId);
+  if (existing != nullptr) {
+    existing->lastSeenAt = millis();
+    return existing;
+  }
+
+  // If an idle link slot is available, also remove stale nodes from the
+  // pool to make room for a fresh connection we really care about.
+  // Find or make room for a new link
+  BleLink *slot = findEmptyLinkSlot();
+  if (slot == nullptr) {
+    // Pool full — evict the least recently used link (oldest lastActivityAt)
+    BleLink *oldest = &bleLinks[0];
+    for (auto &link : bleLinks) {
+      if (link.lastActivityAt < oldest->lastActivityAt) oldest = &link;
+    }
+    slot = oldest;
+    teardownLink(*slot);
+  }
+
+  if (establishLink(*slot, nodeId, addr, addrType)) {
+    bleLine = "BLE link " + nodeIdHex(nodeId).substring(4);
+    return slot;
+  }
+  return nullptr;
+}
+
+// ============================================================================
+//  Original BLE API (some functions modified to use links)
+// ============================================================================
+
 // Look up a BLE node by its mesh node ID.
 // Only returns nodes that are still within the BLE_NODE_TTL_MS window
 // and have a valid BLE address string.
@@ -65,6 +197,8 @@ bool findBleNode(uint32_t nodeId, BleNode &out) {
 
 // Update or create a BLE node entry from a scan result.
 // Also creates a 1-hop route entry to this node (direct BLE reachable).
+// Additionally, the scan result triggers a persistent link establishment
+// in serviceBleLinks() — we just record the node here.
 void updateBleNode(uint32_t nodeId, const String &name, int rssi, const String &address, uint8_t addressType) {
 #if !ENABLE_BLE_MESH
   (void)nodeId; (void)name; (void)rssi; (void)address; (void)addressType;
@@ -226,7 +360,91 @@ void serviceBleLocation() {
   if (screenMode == ScreenMode::Mesh) drawMeshScreen();
 }
 
+// ============================================================================
+//  BLE Link Service — persistent connection pool management
+// ============================================================================
+
+// Service the persistent BLE link pool. Called from loop().
+//  1. Iterates scan result BleNode records and attempts to establish links
+//     for any node not already connected (up to BLE_LINK_POOL_SIZE).
+//  2. Disconnects links that have been idle too long.
+//  3. Reconnects links to nodes still in the scan table but whose
+//     client connection dropped.
+void serviceBleLinks() {
+#if !ENABLE_BLE_MESH
+  return;
+#endif
+  if (!bleReady) return;
+
+  const uint32_t now = millis();
+  if (now - lastBleLinkServiceAt < BLE_LINK_SERVICE_INTERVAL_MS) return;
+  lastBleLinkServiceAt = now;
+
+  // Phase 1: Teardown stale links (idle timeout)
+  for (auto &link : bleLinks) {
+    if (!link.active) continue;
+    if (now - link.lastActivityAt >= BLE_LINK_IDLE_TIMEOUT_MS) {
+      appPrintf("[ble] link idle timeout: node=%08lX\n", static_cast<unsigned long>(link.nodeId));
+      teardownLink(link);
+      continue;
+    }
+    // Check if the client is still connected (may have dropped)
+    if (link.client != nullptr && !link.client->isConnected()) {
+      appPrintf("[ble] link dropped: node=%08lX\n", static_cast<unsigned long>(link.nodeId));
+      teardownLink(link);
+    }
+  }
+
+  // Phase 2: Establish links to newly discovered BLE nodes
+  for (const auto &node : bleNodes) {
+    if (!node.active) continue;
+    if (now - node.lastSeenAt > BLE_NODE_TTL_MS) continue;
+    if (node.nodeId == localNodeId || node.nodeId == 0) continue;
+    if (node.address.length() == 0) continue;
+
+    // Skip if we already have a link to this node
+    if (findLinkByNodeId(node.nodeId) != nullptr) continue;
+    // Skip if we already have a link to this address (stale entry)
+    if (findLinkByAddress(node.address) != nullptr) continue;
+
+    // Check if the pool is full before trying to establish a new link
+    BleLink *slot = findEmptyLinkSlot();
+    if (slot == nullptr) break;  // pool is full, stop trying
+
+    appPrintf("[ble] establishing link to node=%08lX addr=%s\n",
+              static_cast<unsigned long>(node.nodeId), node.address.c_str());
+    establishLink(*slot, node.nodeId, node.address, node.addressType);
+  }
+
+  // Phase 3: Update activity timestamps for still-connected links (keepalive)
+  for (auto &link : bleLinks) {
+    if (!link.active) continue;
+    if (link.client != nullptr && link.client->isConnected()) {
+      link.lastSeenAt = now;
+    }
+  }
+}
+
+// ============================================================================
+//  BLE Transmit — send over persistent link, fallback to blocking
+// ============================================================================
+
+// Send an encoded mesh packet over a persistent BLE link.
+// Returns true if the write succeeded.
+static bool sendOverLink(BleLink &link, const uint8_t *encoded, size_t len) {
+  if (link.txChar == nullptr || link.client == nullptr || !link.client->isConnected()) return false;
+  const bool ok = link.txChar->writeValue(encoded, len, false);
+  if (ok) {
+    link.lastActivityAt = millis();
+    packetStats.bleTx++;
+  } else {
+    packetStats.bleWriteFail++;
+  }
+  return ok;
+}
+
 // Send a mesh packet to a specific BLE node (blocking connect/write/disconnect).
+// This is the fallback when no persistent link exists to the target.
 // Stops scanning and advertising during the connection attempt.
 // Returns true if the packet was successfully written to the remote characteristic.
 bool sendBlePacketToBlocking(uint32_t nodeId, const uint8_t *encoded, size_t len) {
@@ -238,6 +456,15 @@ bool sendBlePacketToBlocking(uint32_t nodeId, const uint8_t *encoded, size_t len
   BleNode node;
   if (!findBleNode(nodeId, node)) return false;
 
+  // First, try to use an existing persistent link
+  BleLink *link = findLinkByNodeId(nodeId);
+  if (link != nullptr) {
+    if (sendOverLink(*link, encoded, len)) return true;
+    // Link write failed, tear it down and fall through to new connection
+    teardownLink(*link);
+  }
+
+  // No persistent link — do connect→write→disconnect
   if (bleScan != nullptr && bleScan->isScanning()) { bleScan->stop(); bleScanInProgress = false; }
   NimBLEDevice::getAdvertising()->stop();
   vTaskDelay(pdMS_TO_TICKS(20));
@@ -316,16 +543,33 @@ bool hasBleTargets() {
 }
 
 // Process a BLE transmit job, sending to a specific node or broadcasting to all nearby.
+// Tries persistent links first, falls back to blocking connect→write→disconnect.
 void processBleTxJob(const BleTxJob &job) {
   if (!job.active) return;
-  if (job.target != BROADCAST_NODE) { sendBlePacketToBlocking(job.target, job.encoded, job.len); return; }
 
+  if (job.target != BROADCAST_NODE) {
+    // Try persistent link first
+    BleLink *link = findLinkByNodeId(job.target);
+    if (link != nullptr) {
+      if (sendOverLink(*link, job.encoded, job.len)) return;
+      // Link failed — teardown and fall through to blocking
+      teardownLink(*link);
+    }
+    sendBlePacketToBlocking(job.target, job.encoded, job.len);
+    return;
+  }
+
+  // Broadcast: send to all known BLE nodes
   const uint32_t now = millis();
   for (const auto &node : bleNodes) {
-    if (node.active && node.address.length() > 0 && now - node.lastSeenAt <= BLE_NODE_TTL_MS) {
-      sendBlePacketToBlocking(node.nodeId, job.encoded, job.len);
-      vTaskDelay(pdMS_TO_TICKS(BLE_TX_SETTLE_MS));
+    if (!node.active || node.address.length() == 0 || now - node.lastSeenAt > BLE_NODE_TTL_MS) continue;
+    BleLink *link = findLinkByNodeId(node.nodeId);
+    if (link != nullptr) {
+      if (sendOverLink(*link, job.encoded, job.len)) continue;
+      teardownLink(*link);
     }
+    sendBlePacketToBlocking(node.nodeId, job.encoded, job.len);
+    vTaskDelay(pdMS_TO_TICKS(BLE_TX_SETTLE_MS));
   }
 }
 
@@ -386,4 +630,17 @@ void serviceBlePacket() {
   blePacketHasPeer = false;
   portEXIT_CRITICAL(&blePacketMux);
   handleBlePacket(localBuffer, localLen, localPeerAddress, localPeerAddressType, localHasPeer);
+}
+
+// Count active (non-expired) BLE-discovered nodes.
+uint8_t activeBleNodeCount() {
+#if !ENABLE_BLE_MESH
+  return 0;
+#else
+  uint8_t count = 0;
+  const uint32_t now = millis();
+  for (const auto &node : bleNodes)
+    if (node.active && now - node.lastSeenAt <= BLE_NODE_TTL_MS) count++;
+  return count;
+#endif
 }

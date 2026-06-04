@@ -81,6 +81,9 @@ bool touchWasPressed = false;
 bool blePacketPending = false;
 bool bleScanInProgress = false;
 bool bleTxBusy = false;
+BleLink bleLinks[BLE_LINK_POOL_SIZE];
+uint32_t lastBleLinkServiceAt = 0;
+uint8_t bleLinkCount = 0;
 uint8_t blePacketBuffer[MAX_PACKET_LEN];
 size_t blePacketLength = 0;
 char blePacketPeerAddress[18] = "";
@@ -210,6 +213,7 @@ void loop() {
   servicePending();
   serviceRelay();
   serviceBeacon();
+  serviceBleLinks();
   serviceBleLocation();
   serviceHopping();
   serviceBattery();

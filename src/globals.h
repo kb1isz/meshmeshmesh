@@ -243,6 +243,7 @@ void serviceRadio();
 void serviceLoRaTransmit();
 void serviceBleTransmit();
 void serviceBlePacket();
+void serviceBleLinks();
 void serviceBleLocation();
 void serviceGroupAcks();
 void serviceInput();
@@ -336,6 +337,9 @@ extern Preferences preferences;
 extern NimBLEScan *bleScan;
 extern NimBLEServer *bleServer;
 extern NimBLECharacteristic *blePacketCharacteristic;
+extern BleLink bleLinks[BLE_LINK_POOL_SIZE];
+extern uint32_t lastBleLinkServiceAt;
+extern uint8_t bleLinkCount;
 
 extern RadioSettings radioSettings;
 extern RadioSettings draftSettings;

@@ -80,19 +80,6 @@ uint8_t activeRouteCount() {
   return count;
 }
 
-// Count active (non-expired) BLE-discovered nodes.
-uint8_t activeBleNodeCount() {
-#if !ENABLE_BLE_MESH
-  return 0;
-#else
-  uint8_t count = 0;
-  const uint32_t now = millis();
-  for (const auto &node : bleNodes)
-    if (node.active && now - node.lastSeenAt <= BLE_NODE_TTL_MS) count++;
-  return count;
-#endif
-}
-
 // Check if any messages are currently pending delivery.
 bool hasPendingMessages() {
   return pending.active || pendingQueueCount > 0;
