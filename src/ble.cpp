@@ -107,14 +107,19 @@ static BleLink *findEmptyLinkSlot() {
 }
 
 // Disconnect and free a BLE link slot gracefully.
-// Records a cooldown for the node so we don't immediately reconnect.
+// Note: we do NOT call NimBLEDevice::deleteClient() here because NimBLE's
+// internal timer handles from the connection may still be pending in the
+// soft device. Deleting the client while timers are queued causes
+// ble_hs_timer_exp asserts. We just disconnect and forget the pointer;
+// NimBLE will clean up the client internally.
 static void teardownLink(BleLink &link) {
   if (link.client != nullptr) {
     if (link.client->isConnected()) {
       link.client->disconnect();
-      vTaskDelay(pdMS_TO_TICKS(20));
     }
-    NimBLEDevice::deleteClient(link.client);
+    // Give NimBLE time to process the disconnect and destroy internal
+    // timer handles before we might create a new client.
+    vTaskDelay(pdMS_TO_TICKS(100));
     link.client = nullptr;
   }
   recordLinkCooldown(link.nodeId);
@@ -138,6 +143,7 @@ static bool establishLink(BleLink &link, uint32_t nodeId, const String &addr, ui
   client->setConnectTimeout(BLE_CONNECT_TIMEOUT_MS);
 
   if (!client->connect(NimBLEAddress(std::string(addr.c_str()), addrType), true, false, false)) {
+    // connect() never completed — no timer handles pending, safe to delete
     NimBLEDevice::deleteClient(client);
     packetStats.bleConnectFail++;
     return false;
@@ -148,11 +154,14 @@ static bool establishLink(BleLink &link, uint32_t nodeId, const String &addr, ui
   // hasn't finished the attribute protocol exchange yet.
   vTaskDelay(pdMS_TO_TICKS(50));
 
-  // Get the remote service and mesh packet characteristic
+  // Get the remote service and mesh packet characteristic.
+  // IMPORTANT: Do NOT call NimBLEDevice::deleteClient() after a successful
+  // connect(), even on service discovery failure. The connection has timers
+  // in the BLE soft device that cause ble_hs_timer_exp asserts if the
+  // client is deleted. Just disconnect and let NimBLE clean up internally.
   NimBLERemoteService *service = client->getService(NimBLEUUID(BLE_MESH_SERVICE_UUID));
   if (service == nullptr) {
     client->disconnect();
-    NimBLEDevice::deleteClient(client);
     packetStats.bleConnectFail++;
     return false;
   }
@@ -160,7 +169,6 @@ static bool establishLink(BleLink &link, uint32_t nodeId, const String &addr, ui
   NimBLERemoteCharacteristic *txChar = service->getCharacteristic(NimBLEUUID(BLE_MESH_PACKET_UUID));
   if (txChar == nullptr) {
     client->disconnect();
-    NimBLEDevice::deleteClient(client);
     packetStats.bleConnectFail++;
     return false;
   }
@@ -499,13 +507,16 @@ bool sendBlePacketToBlocking(uint32_t nodeId, const uint8_t *encoded, size_t len
       if (characteristic != nullptr) ok = characteristic->writeValue(encoded, len, false);
     }
     client->disconnect();
-    vTaskDelay(pdMS_TO_TICKS(80));
+    // Do NOT call NimBLEDevice::deleteClient() after a successful connect().
+    // The connection has timer handles queued in the BLE soft device;
+    // deleting the client causes ble_hs_timer_exp asserts. Just disconnect
+    // and let NimBLE clean up the client internally.
+    vTaskDelay(pdMS_TO_TICKS(100));
   } else {
+    // connect() never completed — no timer handles pending, safe to delete
+    NimBLEDevice::deleteClient(client);
     packetStats.bleConnectFail++;
   }
-
-  NimBLEDevice::deleteClient(client);
-  vTaskDelay(pdMS_TO_TICKS(80));
   if (ok) packetStats.bleTx++; else packetStats.bleWriteFail++;
   lastBleTxAt = millis();
   restartBleAdvertisement();
