@@ -44,6 +44,10 @@ void loadRadioSettings() {
     radioSettings.spreadingFactor = preferences.isKey("sf") ? preferences.getUChar("sf", 10) : 10;
     radioSettings.codingRate = preferences.isKey("cr") ? preferences.getUChar("cr", 6) : 6;
     radioSettings.txPower = preferences.isKey("pwr") ? preferences.getChar("pwr", 22) : 22;
+#if ENABLE_NODE_ROLES
+    nodeRole = preferences.getUChar("role", static_cast<uint8_t>(NodeRole::Relay)) == static_cast<uint8_t>(NodeRole::Leaf)
+                 ? NodeRole::Leaf : NodeRole::Relay;
+#endif
     preferences.end();
   } else { radioSettings = RadioSettings{}; }
   if (!validRadioSettings(radioSettings)) radioSettings = RadioSettings{};
@@ -68,6 +72,9 @@ void saveRadioSettings() {
   preferences.putUChar("sf", radioSettings.spreadingFactor);
   preferences.putUChar("cr", radioSettings.codingRate);
   preferences.putChar("pwr", radioSettings.txPower);
+#if ENABLE_NODE_ROLES
+  preferences.putUChar("role", static_cast<uint8_t>(nodeRole));
+#endif
   preferences.end();
   preferences.begin("identity", false);
   preferences.putString("name", deviceName);

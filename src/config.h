@@ -197,10 +197,13 @@ constexpr uint8_t PACKET_TYPE_CONTACT_REPLY = 10;  // Contact directory reply
 // Maximum body length in bytes (before hex-encoding for encrypted payloads).
 constexpr uint8_t MAX_BODY_LEN = 152;
 
-// Maximum user-facing chat text length (applied before encryption).
-constexpr uint8_t MAX_CHAT_TEXT_LEN = 47;
+// Maximum user-facing chat text length that fits in one encrypted packet.
+constexpr uint8_t MAX_CHAT_TEXT_LEN = 43;
 
-// Maximum fragments per multi-packet message (8 fragments * ~43 chars = ~340 chars).
+// Maximum user-facing long message length when fragmentation is enabled.
+constexpr uint16_t MAX_LONG_CHAT_TEXT_LEN = 340;
+
+// Maximum fragments per multi-packet message.
 constexpr uint8_t MAX_FRAGMENTS = 8;
 
 // Timeout for collecting fragments (ms).
@@ -477,6 +480,7 @@ struct SeenMessage {
 // After a random delay, the packet is retransmitted with decremented TTL.
 struct RelayMessage {
   bool active = false;
+  uint8_t type = PACKET_TYPE_DATA;
   uint32_t source = 0;
   uint32_t destination = BROADCAST_NODE;
   uint32_t messageId = 0;

@@ -31,53 +31,66 @@ uint32_t lastHistorySaveAt = 0;
 // ============================================================================
 
 // Wire format for PACKET_TYPE_FRAGMENT body:
-//   [1 byte total fragments][1 byte this fragment index][...encrypted payload fragment...]
+//   [12 hex chars header][...encrypted payload fragment as hex text...]
+// Header bytes before hex encoding:
+//   [1 byte total fragments][1 byte this fragment index][4 byte base message id]
 // The encrypted payload is split across fragments. Each fragment contains a
 // contiguous portion of the hex-encoded encrypted blob. The receiving end
 // collects all fragments, concatenates them, then decrypts the full payload.
 
-void sendFragmented(const String &body, uint32_t destination, uint32_t conversation) {
+bool sendFragmented(const String &body, uint32_t destination, uint32_t conversation) {
 #if ENABLE_MESSAGE_FRAGMENTATION
   (void)conversation;
   // Encrypt the full message first
   const String fullEncrypted = encryptedPayloadFor(body);
-  if (fullEncrypted.length() == 0) { statusLine = "encryption failed"; drawBottom(); return; }
+  if (fullEncrypted.length() == 0) { statusLine = "encryption failed"; drawBottom(); return false; }
 
   // Calculate how many fragments we need
-  // Each fragment body can hold up to MAX_BODY_LEN - 2 bytes (2 bytes for frag header)
-  constexpr uint8_t FRAG_HEADER_BYTES = 2;
-  constexpr uint8_t FRAG_BODY_BYTES = MAX_BODY_LEN - FRAG_HEADER_BYTES;  // 150 bytes of hex payload per fragment
+  // Each fragment body carries twelve hex header chars plus hex payload, so only
+  // half of the remaining packet body can be encrypted binary data.
+  constexpr uint8_t FRAG_HEADER_CHARS = 12;
+  constexpr uint8_t FRAG_HEADER_BYTES = 6;
+  constexpr uint8_t FRAG_DATA_BYTES = (MAX_BODY_LEN - FRAG_HEADER_CHARS) / 2;
 
   // Convert hex payload to binary for splitting
-  uint8_t encryptedBin[MAX_BODY_LEN];
+  uint8_t encryptedBin[AES_BLOCK_LEN + 16 + 1 + MAX_LONG_CHAT_TEXT_LEN];
   size_t encryptedLen = 0;
-  if (!hexToBytes(fullEncrypted, encryptedBin, MAX_BODY_LEN, encryptedLen)) {
-    statusLine = "encryption too large"; drawBottom(); return;
+  if (!hexToBytes(fullEncrypted, encryptedBin, sizeof(encryptedBin), encryptedLen)) {
+    statusLine = "encryption too large"; drawBottom(); return false;
   }
 
   // Binary fragments: each carries a portion of the encrypted binary data
-  // Fragment body format: [1 byte total][1 byte index][binary data]
-  // Source messageId is shared across all fragments so the receiver can reassociate them
+  // Fragment body format: hex([total][index][base id]) + hex(data)
+  // Each packet gets its own messageId for ACK/retry; the base id in the body
+  // lets the receiver reassociate the fragments.
   const uint32_t baseMsgId = nextMessageId++;
-  const uint8_t totalFrags = (encryptedLen + FRAG_BODY_BYTES - 1) / FRAG_BODY_BYTES;
-  if (totalFrags > MAX_FRAGMENTS) { statusLine = "too many fragments"; drawBottom(); return; }
+  const uint8_t totalFrags = (encryptedLen + FRAG_DATA_BYTES - 1) / FRAG_DATA_BYTES;
+  if (totalFrags > MAX_FRAGMENTS) { statusLine = "too many fragments"; drawBottom(); return false; }
+  nextMessageId = baseMsgId + totalFrags;
+  if (nextMessageId == 0) nextMessageId = 1;
 
   for (uint8_t i = 0; i < totalFrags; ++i) {
-    const size_t offset = static_cast<size_t>(i) * FRAG_BODY_BYTES;
-    const size_t fragLen = min(encryptedLen - offset, static_cast<size_t>(FRAG_BODY_BYTES));
+    const size_t offset = static_cast<size_t>(i) * FRAG_DATA_BYTES;
+    const size_t fragLen = min(encryptedLen - offset, static_cast<size_t>(FRAG_DATA_BYTES));
 
-    String fragBody;
-    fragBody += static_cast<char>(totalFrags);   // byte 0: total fragments
-    fragBody += static_cast<char>(i);             // byte 1: fragment index
+    uint8_t fragHeader[FRAG_HEADER_BYTES];
+    fragHeader[0] = totalFrags;
+    fragHeader[1] = i;
+    fragHeader[2] = static_cast<uint8_t>(baseMsgId & 0xFF);
+    fragHeader[3] = static_cast<uint8_t>((baseMsgId >> 8) & 0xFF);
+    fragHeader[4] = static_cast<uint8_t>((baseMsgId >> 16) & 0xFF);
+    fragHeader[5] = static_cast<uint8_t>((baseMsgId >> 24) & 0xFF);
+
+    String fragBody = bytesToHex(fragHeader, sizeof(fragHeader));
     // Append the binary fragment data as hex string (to keep it text-safe)
     fragBody += bytesToHex(encryptedBin + offset, fragLen);
 
-    // Queue each fragment as a separate pending message with the same base messageId
+    // Queue each fragment as a separate pending message with a unique packet id.
     PendingMessage fragMsg;
     fragMsg.active = true;
     fragMsg.destination = destination;
     fragMsg.conversation = destination;
-    fragMsg.messageId = baseMsgId;
+    fragMsg.messageId = baseMsgId + i;
     fragMsg.body = fragBody;
     fragMsg.fragmentCount = totalFrags;
     fragMsg.fragmentIndex = i;
@@ -85,26 +98,39 @@ void sendFragmented(const String &body, uint32_t destination, uint32_t conversat
     BleNode bleNode;
     fragMsg.prefersBle = destination != BROADCAST_NODE && findBleNode(destination, bleNode);
 
-    if (!enqueuePendingMessage(fragMsg)) { statusLine = "frag queue full"; drawBottom(); return; }
+    if (!enqueuePendingMessage(fragMsg)) { statusLine = "frag queue full"; drawBottom(); return false; }
   }
 
   statusLine = "fragmented " + String(static_cast<int>(totalFrags)) + " parts";
   drawBottom();
+  return true;
 #else
   // Fragmentation disabled — fall through to normal send
   (void)destination;
   (void)conversation;
   queueOutgoing(body);
+  return true;
 #endif
 }
 
 void handleFragment(const Packet &packet) {
 #if ENABLE_MESSAGE_FRAGMENTATION
-  if (packet.body.length() < 2) return;
-  const uint8_t totalFrags = static_cast<uint8_t>(packet.body[0]);
-  const uint8_t fragIndex = static_cast<uint8_t>(packet.body[1]);
+  constexpr uint8_t FRAG_HEADER_CHARS = 12;
+  constexpr uint8_t FRAG_HEADER_BYTES = 6;
+  if (packet.body.length() < FRAG_HEADER_CHARS) return;
+  uint8_t fragHeader[FRAG_HEADER_BYTES];
+  size_t fragHeaderLen = 0;
+  if (!hexToBytes(packet.body.substring(0, FRAG_HEADER_CHARS), fragHeader, sizeof(fragHeader), fragHeaderLen) ||
+      fragHeaderLen != sizeof(fragHeader)) return;
+  const uint8_t totalFrags = fragHeader[0];
+  const uint8_t fragIndex = fragHeader[1];
+  const uint32_t baseMsgId = static_cast<uint32_t>(fragHeader[2]) |
+                             (static_cast<uint32_t>(fragHeader[3]) << 8) |
+                             (static_cast<uint32_t>(fragHeader[4]) << 16) |
+                             (static_cast<uint32_t>(fragHeader[5]) << 24);
   if (totalFrags == 0 || totalFrags > MAX_FRAGMENTS || fragIndex >= totalFrags) return;
-  if (packet.body.length() < 2 + 2) return;  // Need at least total+index+1 byte of hex data
+  if (baseMsgId == 0) return;
+  if (packet.body.length() < FRAG_HEADER_CHARS + 2) return;  // Need at least one byte of hex data
 
   packetStats.fragRx++;
 
@@ -121,7 +147,7 @@ void handleFragment(const Packet &packet) {
   }
 
   for (auto &assembly : fragmentAssemblies) {
-    if (assembly.active && assembly.source == packet.source && assembly.messageId == packet.messageId) {
+    if (assembly.active && assembly.source == packet.source && assembly.messageId == baseMsgId) {
       slot = &assembly;
       break;
     }
@@ -133,7 +159,7 @@ void handleFragment(const Packet &packet) {
   if (!slot->active) {
     slot->active = true;
     slot->source = packet.source;
-    slot->messageId = packet.messageId;
+    slot->messageId = baseMsgId;
     slot->total = totalFrags;
     slot->received = 0;
     slot->startedAt = now;
@@ -144,8 +170,8 @@ void handleFragment(const Packet &packet) {
   // Check if we already have this fragment
   if (slot->received & (1 << fragIndex)) return;
 
-  // Store the hex-encoded fragment payload (everything after the 2-byte header)
-  slot->parts[fragIndex] = packet.body.substring(2);
+  // Store the hex-encoded fragment payload (everything after the header)
+  slot->parts[fragIndex] = packet.body.substring(FRAG_HEADER_CHARS);
   slot->received |= static_cast<uint8_t>(1 << fragIndex);
 
   // Check if all fragments are received
@@ -160,7 +186,7 @@ void handleFragment(const Packet &packet) {
     String sender, message;
     if (decryptPayload(fullHex, sender, message)) {
       const String line = sender.substring(0, 12) + ": " + message;
-      if (slot->source == BROADCAST_NODE) addGroupEntry(line, WHITE);
+      if (packet.destination == BROADCAST_NODE) addGroupEntry(line, WHITE);
       else addDirectEntry(slot->source, sender, line, MAGENTA);
       statusLine = "frag assembled " + String(static_cast<int>(totalFrags)) + " parts";
       packetStats.fragAssembled++;
@@ -623,9 +649,9 @@ void sendEmergency(const String &message) {
     return;
   }
 
-  // Normal enqueue at tail but mark urgent
-  pendingQueue[pendingQueueTail] = emsg;
-  pendingQueueTail = (pendingQueueTail + 1) % TX_QUEUE_DEPTH;
+  // Put the emergency at the front of the pending queue.
+  pendingQueueHead = (pendingQueueHead + TX_QUEUE_DEPTH - 1) % TX_QUEUE_DEPTH;
+  pendingQueue[pendingQueueHead] = emsg;
   pendingQueueCount++;
   packetStats.emergencyTx++;
 

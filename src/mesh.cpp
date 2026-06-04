@@ -338,19 +338,21 @@ void sendRouteReply(uint32_t target, uint32_t requestId) {
 void queueRelay(const Packet &packet) {
   if (packet.ttl <= 1 || packet.destination != BROADCAST_NODE) return;
   relay.active = true;
+  relay.type = packet.type;
   relay.source = packet.source;
   relay.destination = packet.destination;
   relay.messageId = packet.messageId;
   relay.ttl = packet.ttl - 1;
   relay.body = packet.body;
+  relay.isEmergency = packet.type == PACKET_TYPE_EMERGENCY;
   relay.dueAt = millis() + random(250, 900);
 }
 
 void serviceRelay() {
   if (!relay.active || timeBefore(relay.dueAt)) return;
-  if (transmitPacketFrom(PACKET_TYPE_DATA, relay.source, relay.destination, relay.messageId, relay.ttl, BROADCAST_NODE, relay.body)) {
+  if (transmitPacketFrom(relay.type, relay.source, relay.destination, relay.messageId, relay.ttl, BROADCAST_NODE, relay.body)) {
     packetStats.forwarded++;
-    statusLine = "relayed ttl " + String(relay.ttl);
+    statusLine = relay.isEmergency ? "emergency relay" : "relayed ttl " + String(relay.ttl);
     aodvLine = "flood relay " + nodeIdHex(relay.source).substring(4);
     drawBottom();
   }
@@ -458,6 +460,33 @@ bool dequeuePendingMessage(PendingMessage &msg) {
 void queueOutgoing(String body) {
   body.trim();
   if (body.length() == 0) return;
+  if (ENABLE_MESSAGE_FRAGMENTATION && body.length() > MAX_CHAT_TEXT_LEN) {
+    uint32_t destination = BROADCAST_NODE;
+    if (chatTab == ChatTab::Direct) {
+      if (selectedDirectNode == 0) selectDirectChat(firstDirectNode());
+      if (selectedDirectNode == 0) { statusLine = "no direct node"; drawBottom(); return; }
+      destination = selectedDirectNode;
+      selectedDestination = selectedDirectNode;
+    } else {
+      selectedDestination = BROADCAST_NODE;
+    }
+    if (!sendFragmented(body, destination, destination)) return;
+    if (destination == BROADCAST_NODE) {
+      addGroupEntry("me [frag]: " + body.substring(0, MAX_LONG_CHAT_TEXT_LEN), COLOR_ORANGE, 0, true, false);
+#ifdef BOARD_HELTEC_V3
+      appPrintln("me [frag all]: " + body.substring(0, MAX_LONG_CHAT_TEXT_LEN));
+#endif
+    } else {
+      addDirectEntry(destination, nodeDisplayName(destination),
+                     "me [frag ...]: " + body.substring(0, MAX_LONG_CHAT_TEXT_LEN),
+                     YELLOW, 0, true, false);
+#ifdef BOARD_HELTEC_V3
+      appPrintln("me [frag " + nodeIdHex(destination).substring(4) + "]: " + body.substring(0, MAX_LONG_CHAT_TEXT_LEN));
+#endif
+    }
+    drawUi();
+    return;
+  }
   PendingMessage message;
   message.active = true;
   if (chatTab == ChatTab::Direct) {
@@ -495,8 +524,10 @@ void queueOutgoing(String body) {
 void servicePending() {
   if (!pending.active) { if (!dequeuePendingMessage(pending)) return; routeDiscoveryStartedAt = 0; }
   const uint32_t now = millis();
-  if (pending.attempts > 0 && now - pending.lastSentAt < CHAT_ACK_TIMEOUT_MS) return;
-  if (pending.attempts >= CHAT_MAX_RETRIES) {
+  const uint32_t ackTimeoutMs = pending.isEmergency ? EMERGENCY_ACK_TIMEOUT_MS : CHAT_ACK_TIMEOUT_MS;
+  const uint8_t maxRetries = pending.isEmergency ? EMERGENCY_MAX_RETRIES : CHAT_MAX_RETRIES;
+  if (pending.attempts > 0 && now - pending.lastSentAt < ackTimeoutMs) return;
+  if (pending.attempts >= maxRetries) {
     statusLine = "delivery failed";
     markMessageFailed(pending.messageId);
     // Auto-promote to long-term store for non-broadcast messages
@@ -531,8 +562,11 @@ void servicePending() {
   BleNode bleNode;
   const bool useBle = nextHop != BROADCAST_NODE && findBleNode(nextHop, bleNode);
   if (pending.destination != BROADCAST_NODE) updateMessageTransport(pending.messageId, useBle);
-  statusLine = "sending try " + String(pending.attempts) + "/" + String(CHAT_MAX_RETRIES);
-  transmitPacket(PACKET_TYPE_DATA, pending.destination, pending.messageId, MESH_DEFAULT_TTL, nextHop, pending.body);
+  const uint8_t packetType = pending.isEmergency ? PACKET_TYPE_EMERGENCY :
+                             (pending.fragmentCount > 0 ? PACKET_TYPE_FRAGMENT : PACKET_TYPE_DATA);
+  statusLine = pending.isEmergency ? "SOS try " + String(pending.attempts) + "/" + String(maxRetries) :
+               "sending try " + String(pending.attempts) + "/" + String(maxRetries);
+  transmitPacket(packetType, pending.destination, pending.messageId, MESH_DEFAULT_TTL, nextHop, pending.body);
   drawUi();
 }
 
@@ -713,12 +747,18 @@ void handleIncoming(const Packet &packet) {
 
   // Handle new packet types
   if (packet.type == PACKET_TYPE_FRAGMENT) {
+    if (packet.destination != BROADCAST_NODE && packet.destination != localNodeId) { forwardUnicast(packet); return; }
+    if (packet.destination == localNodeId) sendAck(packet);
+    if (packet.destination == BROADCAST_NODE) { scheduleGroupAck(packet); queueRelay(packet); }
     handleFragment(packet);
     return;
   }
 
   if (packet.type == PACKET_TYPE_EMERGENCY) {
     packetStats.emergencyRx++;
+    if (packet.destination != BROADCAST_NODE && packet.destination != localNodeId) { forwardUnicast(packet); return; }
+    if (packet.destination == localNodeId) sendAck(packet);
+    if (packet.destination == BROADCAST_NODE) scheduleGroupAck(packet);
     // Emergency messages are always treated as broadcast — relay immediately with short delay
     if (!isDuplicate(packet.source, packet.messageId)) {
       String sender, message;
@@ -736,6 +776,7 @@ void handleIncoming(const Packet &packet) {
     // Emergency relay always forwards (even leaf nodes relay emergencies)
     if (packet.ttl > 1) {
       relay.active = true;
+      relay.type = PACKET_TYPE_EMERGENCY;
       relay.source = packet.source;
       relay.destination = BROADCAST_NODE;
       relay.messageId = packet.messageId;

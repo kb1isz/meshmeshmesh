@@ -185,9 +185,6 @@ void setup() {
   lastBatteryReadAt = millis();
   appPrintf("[battery] boot: %.2fV %d%%\n", batteryVoltage, static_cast<int>(batteryPercent));
 
-  // Initialize new feature state
-  nodeRole = NodeRole::Relay;  // Default to full relay mode
-
   sendHello();
 #ifdef BOARD_HELTEC_V3
   addLine("serial message ready");

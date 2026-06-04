@@ -248,11 +248,11 @@ bool handleCommand(String line) {
     String body = line.substring(6); body.trim();
     if (body.length() == 0) { statusLine = "empty message"; drawBottom(); return true; }
     uint32_t dest = (chatTab == ChatTab::Direct && selectedDirectNode != 0) ? selectedDirectNode : BROADCAST_NODE;
-    sendFragmented(body, dest, dest);
+    if (!sendFragmented(body, dest, dest)) { drawUi(); return true; }
     if (dest == BROADCAST_NODE) {
-      addGroupEntry("me [frag]: " + body.substring(0, MAX_CHAT_TEXT_LEN), YELLOW, 0, true, false);
+      addGroupEntry("me [frag]: " + body.substring(0, MAX_LONG_CHAT_TEXT_LEN), YELLOW, 0, true, false);
     } else {
-      addDirectEntry(dest, nodeDisplayName(dest), "me [frag]: " + body.substring(0, MAX_CHAT_TEXT_LEN), YELLOW, 0, true, false);
+      addDirectEntry(dest, nodeDisplayName(dest), "me [frag]: " + body.substring(0, MAX_LONG_CHAT_TEXT_LEN), YELLOW, 0, true, false);
     }
     drawUi(); return true;
   }
@@ -371,7 +371,7 @@ void handleInputChar(char key, bool commandsOnly, String *lineOverride) {
     return;
   }
 
-  if (isPrintable(key) && lineBuffer.length() < MAX_BODY_LEN) {
+  if (isPrintable(key) && lineBuffer.length() < MAX_LONG_CHAT_TEXT_LEN) {
     serialLineJustSubmitted = false;
     lineBuffer += key;
     if (!commandsOnly) drawBottom();

@@ -280,7 +280,7 @@ uint32_t hopSlotRemainingMs(int32_t networkTime);
 void applyHopSync(uint8_t remoteSlot, int32_t remoteNetworkTime);
 
 // Message fragmentation
-void sendFragmented(const String &body, uint32_t destination, uint32_t conversation);
+bool sendFragmented(const String &body, uint32_t destination, uint32_t conversation);
 void handleFragment(const Packet &packet);
 void serviceFragments();
 

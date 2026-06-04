@@ -109,15 +109,15 @@ bool aesCtrCrypt(const uint8_t key[AES_KEY_LEN], const uint8_t nonce[AES_BLOCK_L
 // Total: AES_BLOCK_LEN + plainLen bytes, then hex-encoded to 2x that.
 //
 // Plaintext format (before encryption):
-//   [sender name, up to 16 chars]\n[message, up to MAX_CHAT_TEXT_LEN chars]
+//   [sender name, up to 16 chars]\n[message, up to MAX_LONG_CHAT_TEXT_LEN chars]
 //
 // The nonce is generated from the ESP32 hardware RNG (esp_fill_random).
 // Returns an empty string on encryption failure.
 String encryptedPayloadFor(const String &message) {
-  String plain = deviceName.substring(0, 16) + "\n" + message.substring(0, MAX_CHAT_TEXT_LEN);
+  String plain = deviceName.substring(0, 16) + "\n" + message.substring(0, MAX_LONG_CHAT_TEXT_LEN);
   uint8_t key[AES_KEY_LEN];
   uint8_t nonce[AES_BLOCK_LEN];
-  uint8_t cipher[64];
+  uint8_t cipher[16 + 1 + MAX_LONG_CHAT_TEXT_LEN];
   uint8_t framed[AES_BLOCK_LEN + sizeof(cipher)];
 
   deriveEncryptionKey(key);
@@ -145,9 +145,9 @@ String encryptedPayloadFor(const String &message) {
 // On success, extracts the sender name into `sender` and the message into `message`.
 // Returns false if decryption fails or the format is invalid.
 bool decryptPayload(const String &body, String &sender, String &message) {
-  uint8_t framed[MAX_BODY_LEN / 2];
+  uint8_t framed[AES_BLOCK_LEN + 16 + 1 + MAX_LONG_CHAT_TEXT_LEN];
   uint8_t key[AES_KEY_LEN];
-  uint8_t plain[64];
+  uint8_t plain[16 + 1 + MAX_LONG_CHAT_TEXT_LEN];
   size_t framedLen = 0;
 
   if (!hexToBytes(body, framed, sizeof(framed), framedLen) || framedLen <= AES_BLOCK_LEN) return false;

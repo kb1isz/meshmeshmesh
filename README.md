@@ -53,7 +53,7 @@ This is intentionally peer-to-peer and serverless.
 - **Group chat** — broadcast messages to all nodes. Every node receives and displays the message once, then schedules one relay with a random delay to flood the mesh.
 - **Direct chat** — unicast messages to a specific node identified by its 8-hex-digit node ID. The mesh routing layer discovers and maintains routes automatically.
 - **Chat tabs** — switch between Group and Direct chat tabs on the T-Deck screen. The Direct tab cycles through active conversations.
-- **Character counter** — shows typed character count (e.g. `13/47`) in the input field.
+- **Character counter** — shows typed character count (e.g. `13/43`) in the input field.
 - **Message display** — outgoing messages appear in navy bubbles (right-aligned), incoming in maroon bubbles (left-aligned). Messages wider than ~48 characters wrap across multiple rows, rendered bottom-up so the latest content is always visible.
 
 ### Mesh Routing
@@ -111,7 +111,7 @@ Tune these in `platformio.ini`:
 - **AES-256-CTR** encryption using the ESP32 built-in mbedtls library.
 - The encryption key is derived from the user-provided passphrase via **SHA-256**.
 - Wire format (before hex encoding): `[16 bytes nonce][ciphertext...]`
-- Plaintext format before encryption: `[sender name, max 16 chars]\n[message, max 47 chars]`
+- Plaintext format before encryption: `[sender name, max 16 chars]\n[message, max 43 chars]` for single-packet messages, or up to 340 message characters when fragmentation is enabled.
 - The nonce is generated from the ESP32 hardware RNG (`esp_fill_random`).
 - The hex-encoded encrypted payload is placed in the packet body.
 - Both devices must use the same encryption key to read each other's messages.
@@ -120,16 +120,16 @@ Tune these in `platformio.ini`:
 
 ### Message Fragmentation
 
-Messages longer than a single packet can carry are automatically split across up to 8 fragments:
+Messages longer than a single encrypted packet can carry are automatically split across up to 8 fragments:
 
 - The full message is encrypted first, then split into binary fragments.
-- Each fragment carries a 2-byte header (total fragments, fragment index) followed by hex-encoded encrypted data.
-- All fragments share the same base `messageId` so the receiver can reassociate them.
+- Each fragment carries a hex-encoded header (total fragments, fragment index, and base message ID) followed by hex-encoded encrypted data.
+- Each fragment gets its own packet `messageId` for ACK/retry, while the base message ID in the fragment header lets the receiver reassociate them.
 - Fragments are delivered through the normal ACK/retry delivery pipeline.
 - Receiving end collects fragments into assembly slots (up to 4 concurrent assemblies), concatenates them, then decrypts the full payload.
 - Fragment assembly times out after 30 seconds.
 
-Maximum theoretical message length: ~340 characters (8 fragments × ~43 chars each).
+Maximum message length: 340 characters.
 
 Fragmentation counters are visible on the mesh dashboard (Frag RX / Assembled / Timeout).
 
@@ -393,6 +393,7 @@ Type a command into the message input or serial monitor and press Enter:
 | `/to <node-id>` | Select unicast destination, start route discovery if needed |
 | `/discover <node-id>` | Force route discovery for a specific node |
 | `/routes` | Show current route table |
+| `/frag <message>` | Force fragmented delivery for a long message |
 | `/emergency <message>` | Send an emergency priority message |
 | `/send <message>` | Send a chat message (UART0 serial only) |
 | `/role relay` | Set node role to relay (full mesh participation) |

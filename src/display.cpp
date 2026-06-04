@@ -177,7 +177,7 @@ void drawBottom() {
   const String visibleInput = inputLine.substring(0, 36);
   gfx.print(visibleInput);
 
-  // Character count in the input field's right margin (e.g. "13/47").
+  // Character count in the input field's right margin (e.g. "13/43").
   gfx.setTextColor(C_MUTED, C_INPUT_BG);
   gfx.setCursor(UI_WIDTH - 50, INPUT_TOP + 6);
   gfx.printf("%d/%d", static_cast<int>(inputLine.length()), MAX_CHAT_TEXT_LEN);
