@@ -258,6 +258,30 @@ static String helloBody(bool authoritativeSync) {
 #endif
 }
 
+// Propagate a HELLO beacon over all active persistent BLE links.
+// This enables multi-hop BLE topology discovery: a HELLO sent over BLE
+// by node A reaches node C via B, even if A and C are not in direct
+// BLE range. (LoRa HELLO already handles broadcast through relay.)
+static void sendHelloOverBleLinks() {
+#if ENABLE_BLE_MESH
+  String body = helloBody(true);
+  uint8_t encoded[MAX_PACKET_LEN];
+  const size_t len = encodePacket(PACKET_TYPE_HELLO, localNodeId, BROADCAST_NODE,
+                                   esp_random(), 1, BROADCAST_NODE, body, encoded);
+  if (len == 0) return;
+  for (auto &link : bleLinks) {
+    if (!link.active) continue;
+    if (link.txChar == nullptr || link.client == nullptr || !link.client->isConnected()) continue;
+    if (link.txChar->writeValue(encoded, len, false)) {
+      noteTx(PACKET_TYPE_HELLO);
+      link.lastActivityAt = millis();
+    }
+  }
+#else
+  (void)0;  // No-op when BLE mesh is disabled
+#endif
+}
+
 void sendHello() {
 #if ENABLE_FREQ_HOPPING
   // When hopping, use immediate TX so the HELLO carries the correct
@@ -268,9 +292,11 @@ void sendHello() {
 #else
   String body = helloBody(true);
   transmitPacket(PACKET_TYPE_HELLO, BROADCAST_NODE, esp_random(), 1, BROADCAST_NODE, body);
-  lastHelloAt = millis();
   aodvLine = "HELLO sent";
 #endif
+  // Also push HELLO over BLE links for multi-hop BLE topology discovery
+  sendHelloOverBleLinks();
+  lastHelloAt = millis();
 }
 
 // Send a HELLO reply immediately via direct TX, bypassing the queue and CCA.
