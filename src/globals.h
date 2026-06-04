@@ -204,7 +204,7 @@ bool isDuplicate(uint32_t source, uint32_t messageId);
 void handleIncoming(const Packet &packet);
 void sendRouteRequest(uint32_t target);
 void sendHello();
-bool sendHelloImmediate(bool trackSlot = true);
+bool sendHelloImmediate(bool trackSlot = true, bool authoritativeSync = false);
 void queueRelay(const Packet &packet);
 void forwardUnicast(const Packet &packet);
 void cancelGroupAck(uint32_t dataSource, uint32_t messageId);

@@ -243,22 +243,30 @@ void sendAck(const Packet &packet) {
   transmitPacket(PACKET_TYPE_ACK, packet.source, packet.messageId, MESH_DEFAULT_TTL, nextHop, "");
 }
 
-// HELLO beacon carries hop sync data for epoch-based FHSS.
-// Format: "Name//slot//nt" — e.g., "Node-1234//3//45000"
-// - slot: current hopSlot index
-// - nt: sender's hopNetworkTime() at transmission time (for epoch offset calc)
-//   Using network time instead of local millis() is critical: it allows the
-//   receiver to compute the correct hopEpochOffset regardless of the sender's
-//   own offset, because network time is the synchronized reference.
+// HELLO beacon carries hop sync state for epoch-based FHSS.
+// Synced format:    "Name//S//slot//nt" — authoritative sync source.
+// Discovery format: "Name//D//slot//0"  — unsynced boot probe; never sync from it.
+// The explicit state prevents two unsynced booting devices from accepting each
+// other's local millis() as network time.
+static String helloBody(bool authoritativeSync) {
+#if ENABLE_FREQ_HOPPING
+  const char *state = authoritativeSync ? "S" : "D";
+  const int32_t networkTime = authoritativeSync ? static_cast<int32_t>(hopNetworkTime()) : 0;
+  return deviceName.substring(0, 10) + "//" + state + "//" + String(hopSlot) + "//" + String(networkTime);
+#else
+  return deviceName.substring(0, 10) + "//S//" + String(hopSlot) + "//" + String(static_cast<int32_t>(hopNetworkTime()));
+#endif
+}
+
 void sendHello() {
 #if ENABLE_FREQ_HOPPING
   // When hopping, use immediate TX so the HELLO carries the correct
   // frequency and network-time for the current slot. Queued TX (via
   // transmitPacket) would encode stale data by the time CCA backoff
   // completes and serviceHopping() may have already changed frequencies.
-  sendHelloImmediate();
+  sendHelloImmediate(true, hoppingSynced);
 #else
-  String body = deviceName.substring(0, 10) + "//" + String(hopSlot) + "//" + String(static_cast<int32_t>(hopNetworkTime()));
+  String body = helloBody(true);
   transmitPacket(PACKET_TYPE_HELLO, BROADCAST_NODE, esp_random(), 1, BROADCAST_NODE, body);
   lastHelloAt = millis();
   aodvLine = "HELLO sent";
@@ -272,10 +280,12 @@ void sendHello() {
 // If trackSlot is true (default), hopLastTxSlot is updated so the one-TX-per-slot
 // gate applies. Set trackSlot=false for the proactive rendezvous HELLO to avoid
 // blocking data/ACK TX in the same slot.
+// `authoritativeSync` controls whether the HELLO may be used as an FHSS sync
+// source. Unsynced boot probes must pass false.
 // Returns true if the HELLO was actually sent, false if the radio was busy.
-bool sendHelloImmediate(bool trackSlot) {
+bool sendHelloImmediate(bool trackSlot, bool authoritativeSync) {
   if (!radioStarted || radioTransmitting) return false;
-  String body = deviceName.substring(0, 10) + "//" + String(hopSlot) + "//" + String(static_cast<int32_t>(hopNetworkTime()));
+  String body = helloBody(authoritativeSync);
   uint8_t enc[MAX_PACKET_LEN];
   const size_t len = encodePacket(PACKET_TYPE_HELLO, localNodeId, BROADCAST_NODE,
                                    esp_random(), 1, BROADCAST_NODE, body, enc);
@@ -600,8 +610,9 @@ void handleRouteReply(const Packet &packet) {
   forwardRouteReply(packet);
 }
 
-// Extract hop sync data from HELLO beacon body.
-// Supports both legacy format ("Name//3") and epoch format ("Name//3//1234567").
+// Extract authoritative hop sync data from a HELLO beacon body.
+// Current FHSS format is "Name//S//slot//networkTime" for sync sources and
+// "Name//D//slot//0" for unsynced discovery probes.
 // Calls applyHopSync() to compute hopEpochOffset and align the slot clock.
 //
 // IMPORTANT: When already synced, we only reply with our own HELLO so booting
@@ -613,33 +624,24 @@ static bool parseHelloSlot(const String &body) {
   const int sep1 = body.indexOf("//");
   if (sep1 < 0 || static_cast<unsigned int>(sep1 + 2) >= body.length()) return false;
 
-  const uint8_t remoteSlot = static_cast<uint8_t>(body.substring(sep1 + 2).toInt()) % hopCount;
-
   const int sep2 = body.indexOf("//", sep1 + 2);
-  if (sep2 >= 0 && static_cast<unsigned int>(sep2 + 1) < body.length()) {
-    // Epoch format: includes sender's network time.
-    const int32_t remoteNetworkTime = static_cast<int32_t>(body.substring(sep2 + 2).toInt());
-    if (!hoppingSynced) {
-      // Not synced yet — accept sync from any device. applyHopSync() sets
-      // the offset and slot (no retune, no hoppingSynced flag). We mark
-      // ourselves synced so the boot sweep exits and serviceHopping() begins.
-      applyHopSync(remoteSlot, remoteNetworkTime);
-      hoppingSynced = true;
-      lastHopSyncAt = millis();
-      return true;
-    }
-    // Already synced — don't let a booter corrupt our offset.
-    return false;
-  }
+  if (sep2 < 0 || static_cast<unsigned int>(sep2 + 2) >= body.length()) return false;
+
+  const String state = body.substring(sep1 + 2, sep2);
+  if (state != "S") return false;
+
+  const int sep3 = body.indexOf("//", sep2 + 2);
+  if (sep3 < 0 || static_cast<unsigned int>(sep3 + 2) >= body.length()) return false;
+
+  const uint8_t remoteSlot = static_cast<uint8_t>(body.substring(sep2 + 2, sep3).toInt()) % hopCount;
+  const int32_t remoteNetworkTime = static_cast<int32_t>(body.substring(sep3 + 2).toInt());
   if (!hoppingSynced) {
-    // Legacy format fallback (no millis). Set slot directly — less precise
-    // but keeps backward compatibility with pre-epoch firmware.
-    hopSlot = remoteSlot;
+    applyHopSync(remoteSlot, remoteNetworkTime);
     hoppingSynced = true;
     lastHopSyncAt = millis();
-    retuneToFrequency(hopChannels[hopSlot]);
     return true;
   }
+  // Already synced — don't let another node adjust our epoch offset.
   return false;
 }
 
@@ -692,7 +694,7 @@ void handleIncoming(const Packet &packet) {
         const uint32_t nodeStaggerMs = 50 + ((localNodeId % 17) * 65);
         const uint32_t replyDelayMs = min(replyWindowMs, nodeStaggerMs + static_cast<uint32_t>(random(0, 31)));
         delay(replyDelayMs);
-        if (sendHelloImmediate()) {
+        if (sendHelloImmediate(true, true)) {
           appPrintf("[dbg] HELLO REPLY SENT OK\n");
           lastHelloReplyAt = now;
         } else {

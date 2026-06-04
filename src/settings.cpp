@@ -406,19 +406,22 @@ bool retuneToFrequency(float freq) {
   return true;
 }
 
-// Boot-time sync: rendezvous on a single channel until a network device is
-// heard, then lock sync and begin normal frequency hopping.
+// Boot-time sync: rendezvous on a single channel until an authoritative network
+// sync is heard. If none is heard before HOP_RENDEZVOUS_TIMEOUT_MS, this node
+// starts a new cold-boot epoch and broadcasts it on channel 0.
 //
 // Strategy:
 //  - Tune to hopChannels[0] (the well-known rendezvous frequency).
-//  - First transmit a discovery HELLO immediately, then listen for a full hop
-//    interval. This guarantees the booter catches any reply from a synced
-//    device even if the synced device responds after a 0-50ms backoff + airtime.
+//  - First transmit a non-authoritative discovery HELLO immediately, then listen
+//    for a full hop interval. This guarantees the booter catches any reply from
+//    a synced device even if the synced device responds after stagger + airtime.
 //  - Repeat: TX, listen-hopIntervalMs, TX, listen. A synced device visiting
 //    channel 0 will send at most one HELLO per slot, and the booter's long
 //    listen window ensures it doesn't miss the reply.
-//  - As soon as any HELLO arrives, parseHelloSlot() computes hopEpochOffset
-//    and sets hoppingSynced = true — no timeout.
+//  - As soon as an authoritative SYNC HELLO arrives, parseHelloSlot() computes
+//    hopEpochOffset and sets hoppingSynced = true.
+//  - On timeout, cold-start the epoch with current slot pinned to channel 0 and
+//    immediately broadcast an authoritative SYNC HELLO for other waiting nodes.
 void hoppingBootSync() {
   if (!radioStarted || hopChannels == nullptr || hopCount == 0) return;
   appPrintln("Hopping: rendezvous on ch0...");
@@ -429,6 +432,22 @@ void hoppingBootSync() {
   const uint32_t scanStart = millis();
 
   while (!hoppingSynced) {
+    if (millis() - scanStart >= HOP_RENDEZVOUS_TIMEOUT_MS) {
+      hopSlot = 0;
+      hopEpochOffset = -static_cast<int32_t>(millis());
+      hoppingSynced = true;
+      lastHopSyncAt = millis();
+      retuneToFrequency(hopChannels[0]);
+      statusLine = "FHSS cold start";
+      drawBottom();
+      appPrintf("[hop] cold-start epoch after %lu ms slot=%u epo=%ld\n",
+                static_cast<unsigned long>(millis() - scanStart),
+                static_cast<unsigned int>(hopSlot),
+                static_cast<long>(hopEpochOffset));
+      sendHelloImmediate(false, true);
+      break;
+    }
+
     // DEBUG: log TX cycle
     {
       const uint32_t elapsed = millis() - scanStart;
@@ -441,7 +460,7 @@ void hoppingBootSync() {
     // Transmit discovery HELLO first.
     statusLine = "FHSS ch0 TX " + String((millis() - scanStart) / 1000) + "s";
     drawBottom();
-    sendHelloImmediate();
+    sendHelloImmediate(true, false);
 
     // Then listen for a full hop interval. The reply from a synced device
     // will arrive within the airtime (~350ms @ SF10/125kHz) plus 0-50ms
@@ -500,7 +519,7 @@ void serviceHopping() {
   // Proactive HELLO on the rendezvous channel for this device's dedicated slot.
   if (hopSlot == static_cast<uint8_t>(localNodeId % hopCount)) {
     retuneToFrequency(hopChannels[0]);
-    sendHelloImmediate(false);  // trackSlot=false — don't block data/ACK in this slot
+    sendHelloImmediate(false, true);  // trackSlot=false — don't block data/ACK in this slot
     retuneToFrequency(hopChannels[hopSlot]);
   } else {
     retuneToFrequency(hopChannels[hopSlot]);

@@ -204,7 +204,7 @@ Epoch-based time-slotted frequency hopping for improved spectrum utilization and
 - `hopEpochOffset` aligns each device's local millis() to the network epoch, computed from HELLO beacon sync data.
 - The hop interval is computed dynamically from LoRa airtime: `max(2000ms, 2 × maxPacketAirtime)`.
 
-**Boot sync:** A booting device rendezvouses on channel 0, sending discovery HELLOs and listening for replies from synced devices. Once a HELLO with valid sync data is received, `hoppingSynced` is set and normal hopping begins.
+**Boot sync:** A booting device rendezvouses on channel 0, sending non-authoritative discovery HELLOs and listening for authoritative SYNC HELLO replies from synced devices. Unsynced discovery HELLOs are ignored for time sync, so two joining devices cannot accidentally sync to each other's local boot clocks. If no authoritative SYNC HELLO is heard before `HOP_RENDEZVOUS_TIMEOUT_MS`, the device cold-starts a new epoch on channel 0 and broadcasts an authoritative SYNC HELLO so a fresh network can form.
 
 **TX/RX gating:**
 - One TX per slot (prevents flooding a single channel).
@@ -328,7 +328,7 @@ If upload fails, hold the trackball middle button while plugging in USB to enter
 | `ENABLE_NODE_ROLES` | `1` | Enable relay/leaf node roles |
 | `HOP_BAND_MIN_MHZ` | `902.0` | FHSS band lower bound (MHz) |
 | `HOP_BAND_MAX_MHZ` | `928.0` | FHSS band upper bound (MHz) |
-| `HOP_RENDEZVOUS_TIMEOUT_MS` | `15000` | FHSS boot sync timeout (ms) |
+| `HOP_RENDEZVOUS_TIMEOUT_MS` | `180000` | FHSS wait-for-existing-network timeout before cold-starting a new epoch (ms) |
 | `HELTEC_ENABLE_UART0_OUTPUT` | `1` | Mirror serial output to UART0 |
 | `HELTEC_ENABLE_UART0_INPUT` | `1` | Accept guarded input from UART0 |
 

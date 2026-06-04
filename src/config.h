@@ -141,7 +141,7 @@
 // Maximum time (ms) to wait on the rendezvous channel during boot sync
 // before giving up and starting solo.
 #ifndef HOP_RENDEZVOUS_TIMEOUT_MS
-#define HOP_RENDEZVOUS_TIMEOUT_MS 15000
+#define HOP_RENDEZVOUS_TIMEOUT_MS 180000
 #endif
 
 // ============================================================================
