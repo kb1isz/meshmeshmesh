@@ -16,6 +16,7 @@
 // ============================================================================
 
 #include "globals.h"
+#include "compression.h"
 
 // Convert a 4-bit value (0-15) to its uppercase hex character.
 char hexNibble(uint8_t value) {
@@ -104,11 +105,13 @@ bool aesCtrCrypt(const uint8_t key[AES_KEY_LEN], const uint8_t nonce[AES_BLOCK_L
 
 // Encrypt a chat message for transmission.
 //
+// Pipeline: plaintext → smaz compress → AES-CTR encrypt → hex encode
+//
 // Wire format (before hex encoding):
 //   [16 bytes nonce][ciphertext...]
-// Total: AES_BLOCK_LEN + plainLen bytes, then hex-encoded to 2x that.
+// Total: AES_BLOCK_LEN + compressedLen bytes, then hex-encoded to 2x that.
 //
-// Plaintext format (before encryption):
+// Plaintext format (before compression and encryption):
 //   [sender name, up to 16 chars]\n[message, up to MAX_LONG_CHAT_TEXT_LEN chars]
 //
 // The nonce is generated from the ESP32 hardware RNG (esp_fill_random).
@@ -117,37 +120,51 @@ String encryptedPayloadFor(const String &message) {
   String plain = deviceName.substring(0, 16) + "\n" + message.substring(0, MAX_LONG_CHAT_TEXT_LEN);
   uint8_t key[AES_KEY_LEN];
   uint8_t nonce[AES_BLOCK_LEN];
-  uint8_t cipher[16 + 1 + MAX_LONG_CHAT_TEXT_LEN];
+  uint8_t compressed[16 + 1 + MAX_LONG_CHAT_TEXT_LEN];
+  uint8_t cipher[sizeof(compressed)];
   uint8_t framed[AES_BLOCK_LEN + sizeof(cipher)];
 
   deriveEncryptionKey(key);
   esp_fill_random(nonce, sizeof(nonce));
-  const size_t plainLen = min(static_cast<size_t>(plain.length()), sizeof(cipher));
-  if (!aesCtrCrypt(key, nonce, reinterpret_cast<const uint8_t *>(plain.c_str()), plainLen, cipher)) {
+
+  // Compress before encrypting
+  const size_t uncompressedLen = min(static_cast<size_t>(plain.length()), sizeof(compressed));
+  const size_t compressedLen = smaz_compress(plain.c_str(), uncompressedLen, compressed);
+  if (compressedLen == 0 || compressedLen > sizeof(cipher)) {
+    memset(key, 0, sizeof(key));
+    memset(nonce, 0, sizeof(nonce));
+    return "";
+  }
+
+  if (!aesCtrCrypt(key, nonce, compressed, compressedLen, cipher)) {
     memset(key, 0, sizeof(key));
     memset(nonce, 0, sizeof(nonce));
     return "";
   }
   memcpy(framed, nonce, AES_BLOCK_LEN);
-  memcpy(framed + AES_BLOCK_LEN, cipher, plainLen);
+  memcpy(framed + AES_BLOCK_LEN, cipher, compressedLen);
 
   // Zero sensitive stack data before returning.
   memset(key, 0, sizeof(key));
   memset(nonce, 0, sizeof(nonce));
+  memset(compressed, 0, sizeof(compressed));
   memset(cipher, 0, sizeof(cipher));
 
-  return bytesToHex(framed, AES_BLOCK_LEN + plainLen);
+  return bytesToHex(framed, AES_BLOCK_LEN + compressedLen);
 }
 
 // Decrypt a received chat message.
 //
+// Pipeline: hex decode → AES-CTR decrypt → smaz decompress → "sender\nmessage"
+//
 // Expects the body to be a hex-encoded [nonce|ciphertext] blob.
 // On success, extracts the sender name into `sender` and the message into `message`.
-// Returns false if decryption fails or the format is invalid.
+// Returns false if decryption/decompression fails or the format is invalid.
 bool decryptPayload(const String &body, String &sender, String &message) {
   uint8_t framed[AES_BLOCK_LEN + 16 + 1 + MAX_LONG_CHAT_TEXT_LEN];
   uint8_t key[AES_KEY_LEN];
-  uint8_t plain[16 + 1 + MAX_LONG_CHAT_TEXT_LEN];
+  uint8_t decrypted[sizeof(framed) - AES_BLOCK_LEN];
+  char decompressed[SMAZ_MAX_DECOMPRESSED];
   size_t framedLen = 0;
 
   if (!hexToBytes(body, framed, sizeof(framed), framedLen) || framedLen <= AES_BLOCK_LEN) return false;
@@ -155,22 +172,22 @@ bool decryptPayload(const String &body, String &sender, String &message) {
   const size_t cipherLen = framedLen - AES_BLOCK_LEN;
   deriveEncryptionKey(key);
 
-  if (!aesCtrCrypt(key, framed, framed + AES_BLOCK_LEN, cipherLen, plain)) {
+  if (!aesCtrCrypt(key, framed, framed + AES_BLOCK_LEN, cipherLen, decrypted)) {
     memset(key, 0, sizeof(key));
-    memset(plain, 0, sizeof(plain));
+    memset(decrypted, 0, sizeof(decrypted));
     return false;
   }
   memset(key, 0, sizeof(key));
 
-  // Build decoded string from plaintext, stopping at first NUL byte.
-  String decoded;
-  for (size_t i = 0; i < cipherLen; ++i) {
-    if (plain[i] == 0) break;
-    decoded += static_cast<char>(plain[i]);
-  }
-  memset(plain, 0, sizeof(plain));
+  // Decompress the decrypted payload
+  const size_t decompressedLen = smaz_decompress(decrypted, cipherLen, decompressed, sizeof(decompressed));
+  memset(decrypted, 0, sizeof(decrypted));
+  if (decompressedLen == 0) return false;
 
-  // Parse "sender\nmessage" format.
+  // Parse "sender\nmessage" format from decompressed text.
+  String decoded(decompressed);
+  memset(decompressed, 0, sizeof(decompressed));
+
   const int separator = decoded.indexOf('\n');
   if (separator <= 0) return false;
   sender = decoded.substring(0, separator);

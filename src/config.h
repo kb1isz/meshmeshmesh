@@ -198,10 +198,12 @@ constexpr uint8_t PACKET_TYPE_CONTACT_REPLY = 10;  // Contact directory reply
 constexpr uint8_t MAX_BODY_LEN = 152;
 
 // Maximum user-facing chat text length that fits in one encrypted packet.
-constexpr uint8_t MAX_CHAT_TEXT_LEN = 43;
+// Increased from 43 to 75 thanks to smaz compression (~43% gain on chat text).
+constexpr uint8_t MAX_CHAT_TEXT_LEN = 75;
 
 // Maximum user-facing long message length when fragmentation is enabled.
-constexpr uint16_t MAX_LONG_CHAT_TEXT_LEN = 340;
+// Increased from 340 to 600 thanks to smaz compression across 8 fragments.
+constexpr uint16_t MAX_LONG_CHAT_TEXT_LEN = 600;
 
 // Maximum fragments per multi-packet message.
 constexpr uint8_t MAX_FRAGMENTS = 8;
