@@ -1,0 +1,28 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolib/
+.piopkgs/
+.piocore/
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Compiled objects
+*.o
+*.a
+*.srec
+*.elf
+*.hex
+*.bin
+
+# IDE
+.idea/
+*.user
+*.userprefs
