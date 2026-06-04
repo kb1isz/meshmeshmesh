@@ -26,3 +26,5 @@
 .idea/
 *.user
 *.userprefs
+# Agent instructions
+AGENTS.md
