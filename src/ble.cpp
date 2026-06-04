@@ -50,6 +50,41 @@ class MeshPacketCallbacks : public NimBLECharacteristicCallbacks {
 //  BLE Link Pool (persistent connections to peer mesh nodes)
 // ============================================================================
 
+// Busy flag to prevent overlapping NimBLE client operations (connect/teardown).
+// Set during link establishment or teardown, cleared when the operation completes.
+static bool bleLinkBusy = false;
+
+// Cooldown tracking — after tearing down a link, prevent reconnecting to the
+// same node for a short period so NimBLE's soft device timers settle.
+// This avoids `ble_hs_timer_exp` asserts from overlapping client operations.
+#define BLE_LINK_COOLDOWN_MS 10000
+#define BLE_LINK_COOLDOWN_SLOTS 4
+static uint32_t linkCooldownNode[BLE_LINK_COOLDOWN_SLOTS] = {0};
+static uint32_t linkCooldownUntil[BLE_LINK_COOLDOWN_SLOTS] = {0};
+static uint8_t linkCooldownNext = 0;
+
+// Record a node ID in the cooldown table so it won't be reconnected immediately.
+static void recordLinkCooldown(uint32_t nodeId) {
+  const uint32_t until = millis() + BLE_LINK_COOLDOWN_MS;
+  linkCooldownNode[linkCooldownNext] = nodeId;
+  linkCooldownUntil[linkCooldownNext] = until;
+  linkCooldownNext = (linkCooldownNext + 1) % BLE_LINK_COOLDOWN_SLOTS;
+}
+
+// Check if a node is currently in cooldown (recently torn down).
+static bool isLinkOnCooldown(uint32_t nodeId) {
+  const uint32_t now = millis();
+  for (uint8_t i = 0; i < BLE_LINK_COOLDOWN_SLOTS; i++) {
+    if (linkCooldownNode[i] == nodeId && now < linkCooldownUntil[i]) return true;
+    // Expire stale entries
+    if (linkCooldownNode[i] != 0 && now >= linkCooldownUntil[i]) {
+      linkCooldownNode[i] = 0;
+      linkCooldownUntil[i] = 0;
+    }
+  }
+  return false;
+}
+
 // Find a link slot by node ID. Returns nullptr if not found.
 static BleLink *findLinkByNodeId(uint32_t nodeId) {
   for (auto &link : bleLinks)
@@ -72,6 +107,7 @@ static BleLink *findEmptyLinkSlot() {
 }
 
 // Disconnect and free a BLE link slot gracefully.
+// Records a cooldown for the node so we don't immediately reconnect.
 static void teardownLink(BleLink &link) {
   if (link.client != nullptr) {
     if (link.client->isConnected()) {
@@ -81,6 +117,7 @@ static void teardownLink(BleLink &link) {
     NimBLEDevice::deleteClient(link.client);
     link.client = nullptr;
   }
+  recordLinkCooldown(link.nodeId);
   link.txChar = nullptr;
   link.active = false;
   link.nodeId = 0;
@@ -364,25 +401,37 @@ void serviceBleLinks() {
     }
   }
 
-  // Phase 2: Establish links to newly discovered BLE nodes
-  for (const auto &node : bleNodes) {
-    if (!node.active) continue;
-    if (now - node.lastSeenAt > BLE_NODE_TTL_MS) continue;
-    if (node.nodeId == localNodeId || node.nodeId == 0) continue;
-    if (node.address.length() == 0) continue;
+  // Phase 2: Establish links to newly discovered BLE nodes.
+  // Guard: only one connect operation at a time, and skip nodes that
+  // have been recently torn down (cooldown) to let NimBLE timers settle.
+  // This prevents ble_hs_timer_exp asserts from overlapping operations.
+  if (!bleLinkBusy) {
+    bleLinkBusy = true;
+    for (const auto &node : bleNodes) {
+      if (!node.active) continue;
+      if (now - node.lastSeenAt > BLE_NODE_TTL_MS) continue;
+      if (node.nodeId == localNodeId || node.nodeId == 0) continue;
+      if (node.address.length() == 0) continue;
 
-    // Skip if we already have a link to this node
-    if (findLinkByNodeId(node.nodeId) != nullptr) continue;
-    // Skip if we already have a link to this address (stale entry)
-    if (findLinkByAddress(node.address) != nullptr) continue;
+      // Skip if this node was recently torn down (cooldown)
+      if (isLinkOnCooldown(node.nodeId)) continue;
 
-    // Check if the pool is full before trying to establish a new link
-    BleLink *slot = findEmptyLinkSlot();
-    if (slot == nullptr) break;  // pool is full, stop trying
+      // Skip if we already have a link to this node or address
+      if (findLinkByNodeId(node.nodeId) != nullptr) continue;
+      if (findLinkByAddress(node.address) != nullptr) continue;
 
-    appPrintf("[ble] establishing link to node=%08lX addr=%s\n",
-              static_cast<unsigned long>(node.nodeId), node.address.c_str());
-    establishLink(*slot, node.nodeId, node.address, node.addressType);
+      // Check if the pool is full
+      BleLink *slot = findEmptyLinkSlot();
+      if (slot == nullptr) break;  // pool is full, stop trying
+
+      appPrintf("[ble] establishing link to node=%08lX addr=%s\n",
+                static_cast<unsigned long>(node.nodeId), node.address.c_str());
+      establishLink(*slot, node.nodeId, node.address, node.addressType);
+      // Only attempt one connection per service cycle to avoid flooding
+      // NimBLE with concurrent operations.
+      break;
+    }
+    bleLinkBusy = false;
   }
 
   // Phase 3: Update activity timestamps for still-connected links (keepalive)
