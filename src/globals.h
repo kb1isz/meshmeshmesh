@@ -423,6 +423,7 @@ extern uint8_t hopCount;          // number of hop channels
 extern uint8_t hopSlot;
 extern bool hoppingSynced;
 extern int32_t hopEpochOffset;
+extern uint32_t hopBootSyncStart;  // millis() when hoppingBootSync started (0 = not booting)
 extern uint32_t lastHopSyncAt;
 extern uint32_t hopIntervalMs;    // ms per hop (computed from LoRa airtime)
 extern uint8_t hopLastTxSlot;     // slot of last TX (for one-TX-per-slot gate)

@@ -100,6 +100,7 @@ uint8_t hopCount = 0;
 uint8_t hopSlot = 0;
 bool hoppingSynced = false;
 int32_t hopEpochOffset = 0;
+uint32_t hopBootSyncStart = 0;  // set when hoppingBootSync begins
 uint32_t lastHopSyncAt = 0;
 uint32_t hopIntervalMs = 2000;
 uint8_t hopLastTxSlot = 0xFF;  // slot of last TX (init to invalid)

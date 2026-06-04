@@ -190,21 +190,35 @@ Enabled by default (`-DENABLE_CONTACTS=1`).
 
 ### Frequency Hopping FHSS
 
-Epoch-based time-slotted frequency hopping for improved spectrum utilization and resistance to interference. Enabled by default in the `tdeck` build (`-DENABLE_FREQ_HOPPING=1`).
+Epoch-based time-slotted frequency hopping for improved spectrum utilization and resistance to interference. Enabled by default in both the `tdeck` and `heltec_v3` builds (`-DENABLE_FREQ_HOPPING=1`).
 
-**How it works:**
+**HELLO beacon format:**
 
-- A set of channels is computed from the ISM band (902-928 MHz US, configured via `HOP_BAND_MIN_MHZ`/`HOP_BAND_MAX_MHZ`) divided by the configured bandwidth.
-- Channels are shuffled using the encryption key as a seed (so all devices with the same key share the same hop sequence).
-- Each device computes the current hop slot from a synchronized network time:
-  ```
-  networkTime = millis() + hopEpochOffset
-  hopSlot = (networkTime / HOP_INTERVAL_MS) % HOP_COUNT
-  ```
-- `hopEpochOffset` aligns each device's local millis() to the network epoch, computed from HELLO beacon sync data.
+Each HELLO carries hop sync data: `"Name//slot//nt//flag"`
+- `slot` — current hop slot index
+- `nt` — sender's `hopNetworkTime()` at transmission time, used by receivers to compute `hopEpochOffset`
+- `flag` — `1` if the sender is already synced, `0` if still booting
+
+**How slot computation works:**
+
+```
+networkTime = millis() + hopEpochOffset
+hopSlot = (networkTime / HOP_INTERVAL_MS) % HOP_COUNT
+```
+
+- `hopEpochOffset` aligns each device's local millis() to the network epoch, computed from the first valid HELLO received during boot sync.
 - The hop interval is computed dynamically from LoRa airtime: `max(2000ms, 2 × maxPacketAirtime)`.
+- Channels are shuffled using the encryption key as a seed (all devices with the same key share the same hop sequence).
 
-**Boot sync:** A booting device rendezvouses on channel 0, sending discovery HELLOs and listening for replies from synced devices. Once a HELLO with valid sync data is received, `hoppingSynced` is set and normal hopping begins.
+**Boot sync — split-network prevention:**
+
+A booting device rendezvouses on channel 0, sending discovery HELLOs (flag=0) and listening for replies. It **rejects HELLOs from other booting devices** (flag=0) to prevent two devices from forming a separate FHSS network. Only HELLOs from already-synced devices (flag=1) are accepted.
+
+If no synced device is heard after `HOP_RENDEZVOUS_TIMEOUT_MS` (120s), the booter relaxes this filter and accepts any HELLO — enabling a cold-start scenario where two booting devices can form a new network when no existing network is present.
+
+**Drift correction:**
+
+Once synced, the epoch offset is continuously corrected from incoming HELLOs sent by other synced peers. Small discrepancies (< one hop interval) are applied to `hopEpochOffset`, preventing cumulative crystal oscillator drift from eroding slot alignment over time.
 
 **TX/RX gating:**
 - One TX per slot (prevents flooding a single channel).
@@ -218,8 +232,6 @@ Epoch-based time-slotted frequency hopping for improved spectrum utilization and
 - Epoch offset in ms
 - Network time
 - Time since last sync
-
-Disabled by default in the `heltec_v3` build. The `tdeck` build has it enabled.
 
 ### Bluetooth Mesh Transport
 
@@ -318,7 +330,7 @@ If upload fails, hold the trackball middle button while plugging in USB to enter
 | `CHAT_MAX_RETRIES` | `8` | Maximum ACK retry attempts per message |
 | `CHAT_ACK_TIMEOUT_MS` | `2500` | Time between retries (ms) |
 | `ENABLE_BLE_MESH` | `0` | Enable BLE mesh transport |
-| `ENABLE_FREQ_HOPPING` | `0` (1 for tdeck) | Enable frequency hopping FHSS |
+| `ENABLE_FREQ_HOPPING` | `1` (both builds) | Enable frequency hopping FHSS |
 | `ENABLE_MESSAGE_FRAGMENTATION` | `1` | Enable long-message fragmentation |
 | `ENABLE_STORE_FORWARD` | `1` | Enable flash-backed message queue |
 | `ENABLE_PERSISTENT_HISTORY` | `1` | Enable chat history persistence |
@@ -328,7 +340,7 @@ If upload fails, hold the trackball middle button while plugging in USB to enter
 | `ENABLE_NODE_ROLES` | `1` | Enable relay/leaf node roles |
 | `HOP_BAND_MIN_MHZ` | `902.0` | FHSS band lower bound (MHz) |
 | `HOP_BAND_MAX_MHZ` | `928.0` | FHSS band upper bound (MHz) |
-| `HOP_RENDEZVOUS_TIMEOUT_MS` | `15000` | FHSS boot sync timeout (ms) |
+| `HOP_RENDEZVOUS_TIMEOUT_MS` | `120000` | FHSS boot sync timeout (ms) |
 | `HELTEC_ENABLE_UART0_OUTPUT` | `1` | Mirror serial output to UART0 |
 | `HELTEC_ENABLE_UART0_INPUT` | `1` | Accept guarded input from UART0 |
 

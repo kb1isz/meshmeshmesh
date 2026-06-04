@@ -414,6 +414,7 @@ bool retuneToFrequency(float freq) {
 //    and sets hoppingSynced = true — no timeout.
 void hoppingBootSync() {
   if (!radioStarted || hopChannels == nullptr || hopCount == 0) return;
+  hopBootSyncStart = millis();
   appPrintln("Hopping: rendezvous on ch0...");
   const float rendezvousFreq = hopChannels[0];
   if (!retuneToFrequency(rendezvousFreq)) return;

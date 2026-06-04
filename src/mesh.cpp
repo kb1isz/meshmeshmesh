@@ -258,7 +258,7 @@ void sendHello() {
   // completes and serviceHopping() may have already changed frequencies.
   sendHelloImmediate();
 #else
-  String body = deviceName.substring(0, 10) + "//" + String(hopSlot) + "//" + String(static_cast<int32_t>(hopNetworkTime()));
+  String body = deviceName.substring(0, 10) + "//" + String(hopSlot) + "//" + String(static_cast<int32_t>(hopNetworkTime())) + "//" + (hoppingSynced ? "1" : "0");
   transmitPacket(PACKET_TYPE_HELLO, BROADCAST_NODE, esp_random(), 1, BROADCAST_NODE, body);
   lastHelloAt = millis();
   aodvLine = "HELLO sent";
@@ -275,7 +275,7 @@ void sendHello() {
 // Returns true if the HELLO was actually sent, false if the radio was busy.
 bool sendHelloImmediate(bool trackSlot) {
   if (!radioStarted || radioTransmitting) return false;
-  String body = deviceName.substring(0, 10) + "//" + String(hopSlot) + "//" + String(static_cast<int32_t>(hopNetworkTime()));
+  String body = deviceName.substring(0, 10) + "//" + String(hopSlot) + "//" + String(static_cast<int32_t>(hopNetworkTime())) + "//" + (hoppingSynced ? "1" : "0");
   uint8_t enc[MAX_PACKET_LEN];
   const size_t len = encodePacket(PACKET_TYPE_HELLO, localNodeId, BROADCAST_NODE,
                                    esp_random(), 1, BROADCAST_NODE, body, enc);
@@ -585,16 +585,56 @@ static bool parseHelloSlot(const String &body) {
   if (sep2 >= 0 && static_cast<unsigned int>(sep2 + 1) < body.length()) {
     // Epoch format: includes sender's network time.
     const int32_t remoteNetworkTime = static_cast<int32_t>(body.substring(sep2 + 2).toInt());
+
+    // Parse optional sync-status flag (3rd separator: "Name//slot//nt//flag")
+    // flag = "1" means sender is synced, "0" means booting.
+    // Absent = backward compatible — assume synced (old firmware).
+    const int sep3 = body.indexOf("//", sep2 + 2);
+    bool remoteSynced = true;
+    if (sep3 >= 0 && static_cast<unsigned int>(sep3 + 2) < body.length()) {
+      String flag = body.substring(sep3 + 2);
+      flag.trim();
+      remoteSynced = (flag == "1");
+    }
+
     if (!hoppingSynced) {
-      // Not synced yet — accept sync from any device. applyHopSync() sets
-      // the offset and slot (no retune, no hoppingSynced flag). We mark
-      // ourselves synced so the boot sweep exits and serviceHopping() begins.
+      // Not synced yet. Only accept sync from a device that reports
+      // itself as synced (flag=1), unless we've been booting for longer
+      // than HOP_RENDEZVOUS_TIMEOUT_MS — in that case accept any HELLO
+      // as a cold-start fallback (allows two booting devices to form a
+      // new network when no synced network exists).
+      if (!remoteSynced) {
+        const bool timeoutPassed = (hopBootSyncStart > 0 && millis() - hopBootSyncStart > HOP_RENDEZVOUS_TIMEOUT_MS);
+        if (!timeoutPassed) {
+          appPrintf("[dbg] BOOT reject: remote not synced (flag=0) timeout=%lu/%lu\n",
+                    static_cast<unsigned long>(millis() - hopBootSyncStart),
+                    static_cast<unsigned long>(HOP_RENDEZVOUS_TIMEOUT_MS));
+          return false;
+        }
+        appPrintf("[dbg] BOOT accept cold-start (flag=0 after timeout)\n");
+      }
       applyHopSync(remoteSlot, remoteNetworkTime);
       hoppingSynced = true;
       lastHopSyncAt = millis();
       return true;
     }
-    // Already synced — don't let a booter corrupt our offset.
+    // Already synced. Apply a small correction if the sender is also synced
+    // (flag=1) and the discrepancy is within one hop interval. This prevents
+    // cumulative crystal drift over time while protecting against a booting
+    // device's wildly-uncalibrated timebase corrupting our epoch offset.
+    if (remoteSynced) {
+      const int32_t localNetworkTime = hopNetworkTime();
+      const int32_t drift = remoteNetworkTime - localNetworkTime;
+      // Correct drift in either direction if within one hop interval.
+      // This protects against a booter's wildly-uncalibrated timebase
+      // while still preventing cumulative crystal drift.
+      const uint32_t absDrift = drift >= 0 ? static_cast<uint32_t>(drift) : static_cast<uint32_t>(-drift);
+      if (absDrift < hopIntervalMs) {
+        hopEpochOffset = remoteNetworkTime - static_cast<int32_t>(millis());
+        lastHopSyncAt = millis();
+        appPrintf("[hop] drift correction =%ld ms\n", static_cast<long>(drift));
+      }
+    }
     return false;
   }
   if (!hoppingSynced) {
