@@ -158,22 +158,9 @@ void serviceRadio() {
     // Skip false ISR triggers (noise at ~-111 RSSI) that cause readData()
     // to return ERR_NONE but getPacketLength() returns 0.
     if (packetLen == 0) {
-#if ENABLE_FREQ_HOPPING
-      appPrintf("[dbg] RX len=0 rssi=%d (noise trigger) slot=%u freq=%.1f MHz synced=%c\n",
-                static_cast<int>(radio.getRSSI()),
-                hopSlot,
-                static_cast<double>(hoppingSynced ? hopChannels[hopSlot] : hopChannels[0]),
-                hoppingSynced ? 'Y' : 'N');
-#endif
       return;
     }
     Packet packet;
-#if ENABLE_FREQ_HOPPING
-    const bool syncState = hoppingSynced;
-    const uint8_t rxSlot = hopSlot;
-    // Report the actual frequency the radio is tuned to, independent of sync state.
-    const float rxFreq = hoppingSynced ? hopChannels[hopSlot] : (radioStarted ? hopChannels[0] : radioSettings.frequency);
-#endif
     const bool decoded = decodePacket(buffer, packetLen, packet);
     if (decoded) {
       noteRx(packet.type);
@@ -186,23 +173,6 @@ void serviceRadio() {
       hopLastRxSlot = hopSlot;
 #endif
     }
-#if ENABLE_FREQ_HOPPING
-    // DEBUG: log every received packet with hop context
-    {
-      appPrintf("[dbg] RX len=%u rssi=%d decode=%c slot=%u freq=%.1f MHz synced=%c\n",
-                packetLen, static_cast<int>(radio.getRSSI()),
-                decoded ? 'Y' : 'N',
-                rxSlot, static_cast<double>(rxFreq), syncState ? 'Y' : 'N');
-      if (!decoded) {
-        // Dump raw first bytes of failed packet
-        appPrintf("[dbg] RAW pkt=%02x %02x %02x %02x %02x %02x\n",
-                  buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5]);
-      }
-      if (decoded && packet.type == PACKET_TYPE_HELLO) {
-        appPrintf("[dbg] HELLO body=\"%s\"\n", packet.body.c_str());
-      }
-    }
-#endif
   }
   radio.startReceive();
 }
@@ -215,11 +185,12 @@ bool transmitPacketFrom(uint8_t type, uint32_t source, uint32_t destination, uin
     BleNode bleNode;
     const bool bleReachable = findBleNode(nextHop, bleNode);
     if (bleReachable) sentBle = enqueueBlePacket(nextHop, encoded, len, type);
-    if (sentBle || bleReachable) { if (sentBle) noteTx(type); return sentBle; }
+    if (sentBle) return true;
+    if (bleReachable) statusLine = "BLE busy; queued LoRa";
   }
   if (nextHop == BROADCAST_NODE) {
     sentBle = hasBleTargets() && enqueueBlePacket(BROADCAST_NODE, encoded, len, type);
-    if (sentBle) { noteTx(type); if (type == PACKET_TYPE_DATA) statusLine = "sent BLE; queued LoRa"; }
+    if (sentBle && type == PACKET_TYPE_DATA) statusLine = "queued BLE + LoRa";
   }
   if (!radioStarted) return sentBle;
   return enqueueLoRaPacket(encoded, len, type) || sentBle;
@@ -258,27 +229,36 @@ static String helloBody(bool authoritativeSync) {
 #endif
 }
 
-// Propagate a HELLO beacon over all active persistent BLE links.
-// This enables multi-hop BLE topology discovery: a HELLO sent over BLE
-// by node A reaches node C via B, even if A and C are not in direct
-// BLE range. (LoRa HELLO already handles broadcast through relay.)
-static void sendHelloOverBleLinks() {
+// Queue a HELLO beacon for nearby BLE peers discovered by advertisement scans.
+// Persistent BLE links are disabled for stability, so HELLO uses the same
+// on-demand BLE transmit queue as chat, ACK, and route packets.
+void queueBleHelloBroadcast(bool authoritativeSync) {
 #if ENABLE_BLE_MESH
-  String body = helloBody(true);
+  String body = helloBody(authoritativeSync);
   uint8_t encoded[MAX_PACKET_LEN];
   const size_t len = encodePacket(PACKET_TYPE_HELLO, localNodeId, BROADCAST_NODE,
                                    esp_random(), 1, BROADCAST_NODE, body, encoded);
   if (len == 0) return;
-  for (auto &link : bleLinks) {
-    if (!link.active) continue;
-    if (link.txChar == nullptr || link.client == nullptr || !link.client->isConnected()) continue;
-    if (link.txChar->writeValue(encoded, len, false)) {
-      noteTx(PACKET_TYPE_HELLO);
-      link.lastActivityAt = millis();
-    }
+  if (hasBleTargets()) {
+    enqueueBlePacket(BROADCAST_NODE, encoded, len, PACKET_TYPE_HELLO);
   }
 #else
   (void)0;  // No-op when BLE mesh is disabled
+#endif
+}
+
+void queueBleHelloTo(uint32_t target, bool authoritativeSync) {
+#if ENABLE_BLE_MESH
+  if (target == BROADCAST_NODE || target == localNodeId) return;
+  String body = helloBody(authoritativeSync);
+  uint8_t encoded[MAX_PACKET_LEN];
+  const size_t len = encodePacket(PACKET_TYPE_HELLO, localNodeId, BROADCAST_NODE,
+                                   esp_random(), 1, BROADCAST_NODE, body, encoded);
+  if (len == 0) return;
+  enqueueBlePacket(target, encoded, len, PACKET_TYPE_HELLO);
+#else
+  (void)target;
+  (void)authoritativeSync;
 #endif
 }
 
@@ -294,8 +274,8 @@ void sendHello() {
   transmitPacket(PACKET_TYPE_HELLO, BROADCAST_NODE, esp_random(), 1, BROADCAST_NODE, body);
   aodvLine = "HELLO sent";
 #endif
-  // Also push HELLO over BLE links for multi-hop BLE topology discovery
-  sendHelloOverBleLinks();
+  // Also push HELLO over BLE-discovered peers.
+  queueBleHelloBroadcast(hoppingSynced);
   lastHelloAt = millis();
 }
 
@@ -701,19 +681,16 @@ void handleIncoming(const Packet &packet) {
     const bool wasSynced = hoppingSynced;
     parseHelloSlot(packet.body);
 
-    // DEBUG: log every HELLO and the reply decision
     {
       static uint32_t lastHelloReplyAt = 0;
       const uint32_t now = millis();
       const uint32_t age = now - lastHelloReplyAt;
       const bool replyReady = wasSynced && age > hopIntervalMs;
-      appPrintf("[dbg] HELLO wasSynced=%c age=%lu/%lu ms replyReady=%c slot=%u freq=%.1f MHz\n",
-                wasSynced ? 'Y' : 'N',
-                static_cast<unsigned long>(age),
-                static_cast<unsigned long>(hopIntervalMs),
-                replyReady ? 'Y' : 'N',
-                hopSlot, static_cast<double>(hopChannels[hopSlot]));
       if (replyReady) {
+        BleNode bleNode;
+        if (findBleNode(packet.source, bleNode)) {
+          queueBleHelloTo(packet.source, true);
+        }
         // Spread replies from multiple synced peers so a joining node is less
         // likely to hear overlapping HELLO responses.
         const uint32_t replyWindowMs = max(static_cast<uint32_t>(100), min(static_cast<uint32_t>(1200), hopIntervalMs / 2));
@@ -721,10 +698,7 @@ void handleIncoming(const Packet &packet) {
         const uint32_t replyDelayMs = min(replyWindowMs, nodeStaggerMs + static_cast<uint32_t>(random(0, 31)));
         delay(replyDelayMs);
         if (sendHelloImmediate(true, true)) {
-          appPrintf("[dbg] HELLO REPLY SENT OK\n");
           lastHelloReplyAt = now;
-        } else {
-          appPrintf("[dbg] HELLO REPLY FAILED (radio busy)\n");
         }
       }
     }

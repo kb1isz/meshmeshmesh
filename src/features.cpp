@@ -281,8 +281,6 @@ void loadStoredMessages() {
     // Schedule first retry after the normal interval from boot
     sm.nextRetryAt = millis() + STORE_FORWARD_RETRY_MS;
 
-    appPrintf("[sfwd] restored stored msg to %08lX (%s)\n",
-              static_cast<unsigned long>(sm.destination), sm.rawText.c_str());
   }
   preferences.end();
 #else
@@ -329,9 +327,7 @@ void triggerStoredMessageRetry(uint32_t nodeId) {
     sm.nextRetryAt = millis();
     found = true;
   }
-  if (found) {
-    appPrintf("[sfwd] triggered retry for %08lX\n", static_cast<unsigned long>(nodeId));
-  }
+  (void)found;
 #else
   (void)nodeId;
 #endif
@@ -349,8 +345,6 @@ void retryStoredMessages() {
       // Expire the message
       sm.active = false;
       anyChanged = true;
-      appPrintf("[sfwd] expired stored msg to %08lX (%s)\n",
-                static_cast<unsigned long>(sm.destination), sm.rawText.c_str());
       continue;
     }
 

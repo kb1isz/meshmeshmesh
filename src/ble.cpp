@@ -1,13 +1,11 @@
 // ============================================================================
-// ble.cpp — BLE mesh transport: persistent links, scanning, and packet exchange
+// ble.cpp — BLE mesh transport: scanning and packet exchange
 //
 // Implements:
 //  - BLE GATT service for mesh packet relay (when ENABLE_BLE_MESH=1)
 //  - Manufacturer advertisement beacon with node ID and name
 //  - Periodic scanning for nearby T-Deck mesh nodes
-//  - Persistent BLE connection pool (BleLink) for low-latency multi-hop mesh
-//  - BLE link keepalive, idle timeout, and automatic reconnect
-//  - BLE transmit queue with send over links or fallback to connect→write→disconnect
+//  - BLE transmit queue with on-demand connect→write→disconnect delivery
 //
 // SECURITY NOTE: When BLE is enabled, the mesh packet GATT characteristic
 // accepts unauthenticated writes from any BLE device. No pairing, bonding,
@@ -44,14 +42,29 @@ class MeshPacketCallbacks : public NimBLECharacteristicCallbacks {
     }
   }
 };
+
+class MeshServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer *server, NimBLEConnInfo &connInfo) override {
+    (void)server;
+    (void)connInfo;
+    bleLine = "BLE peer connected";
+  }
+
+  void onDisconnect(NimBLEServer *server, NimBLEConnInfo &connInfo, int reason) override {
+    (void)server;
+    (void)connInfo;
+    (void)reason;
+    bleLine = "BLE peer disconnected";
+    restartBleAdvertisement();
+  }
+};
 } // namespace
 
 // ============================================================================
-//  BLE Link Pool (persistent connections to peer mesh nodes)
+//  BLE Link Pool (dormant persistent-link support)
 // ============================================================================
 
-// Busy flag to prevent overlapping NimBLE client operations (connect/teardown).
-// Set during link establishment or teardown, cleared when the operation completes.
+// Busy flag for the dormant persistent-link path.
 static bool bleLinkBusy = false;
 
 // Cooldown tracking — after tearing down a link, prevent reconnecting to the
@@ -68,6 +81,49 @@ static uint32_t lastClientOpAt = 0;
 static uint32_t linkCooldownNode[BLE_LINK_COOLDOWN_SLOTS] = {0};
 static uint32_t linkCooldownUntil[BLE_LINK_COOLDOWN_SLOTS] = {0};
 static uint8_t linkCooldownNext = 0;
+static uint32_t lastBleAdvRefreshAt = 0;
+static TaskHandle_t bleTxTaskHandle = nullptr;
+
+constexpr size_t BLE_ADV_MARKER_LEN = 4;
+constexpr size_t BLE_ADV_NONCE_SEED_LEN = 4;
+constexpr size_t BLE_ADV_PLAIN_LEN = 18;
+constexpr size_t BLE_ADV_NAME_LEN = 6;
+constexpr size_t BLE_ADV_TOTAL_LEN = BLE_ADV_MARKER_LEN + BLE_ADV_NONCE_SEED_LEN + BLE_ADV_PLAIN_LEN;
+
+static void buildBleAdvNonce(uint32_t seed, uint8_t nonce[AES_BLOCK_LEN]) {
+  memset(nonce, 0, AES_BLOCK_LEN);
+  nonce[0] = 'T';
+  nonce[1] = 'D';
+  nonce[2] = 'A';
+  nonce[3] = '4';
+  nonce[4] = static_cast<uint8_t>(seed & 0xFF);
+  nonce[5] = static_cast<uint8_t>((seed >> 8) & 0xFF);
+  nonce[6] = static_cast<uint8_t>((seed >> 16) & 0xFF);
+  nonce[7] = static_cast<uint8_t>((seed >> 24) & 0xFF);
+}
+
+static bool cryptBleAdvPayload(uint32_t nonceSeed, const uint8_t *input, uint8_t *output) {
+  uint8_t key[AES_KEY_LEN];
+  uint8_t nonce[AES_BLOCK_LEN];
+  deriveEncryptionKey(key);
+  buildBleAdvNonce(nonceSeed, nonce);
+  const bool ok = aesCtrCrypt(key, nonce, input, BLE_ADV_PLAIN_LEN, output);
+  memset(key, 0, sizeof(key));
+  memset(nonce, 0, sizeof(nonce));
+  return ok;
+}
+
+static bool bleClientOpCoolingDown() {
+  return millis() - lastClientOpAt < BLE_CLIENT_OP_COOLDOWN_MS;
+}
+
+static void bleTransmitTask(void *parameter) {
+  (void)parameter;
+  for (;;) {
+    serviceBleTransmit();
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
 
 // Record a node ID in the cooldown table so it won't be reconnected immediately.
 static void recordLinkCooldown(uint32_t nodeId) {
@@ -147,7 +203,7 @@ static bool establishLink(BleLink &link, uint32_t nodeId, const String &addr, ui
   // Global cooldown: skip this attempt if NimBLE timers may still be settling
   // from a previous client operation. The caller (serviceBleLinks) will retry
   // on the next service cycle (2 seconds).
-  if (millis() - lastClientOpAt < BLE_CLIENT_OP_COOLDOWN_MS) return false;
+  if (bleClientOpCoolingDown()) return false;
 
   NimBLEClient *client = NimBLEDevice::createClient();
   if (client == nullptr) return false;
@@ -228,10 +284,8 @@ bool findBleNode(uint32_t nodeId, BleNode &out) {
   return false;
 }
 
-// Update or create a BLE node entry from a scan result.
-// Also creates a 1-hop route entry to this node (direct BLE reachable).
-// Additionally, the scan result triggers a persistent link establishment
-// in serviceBleLinks() — we just record the node here.
+// Update or create a BLE node entry from a scan result. Also creates a 1-hop
+// route entry to this node so the transmitter can try BLE before LoRa.
 void updateBleNode(uint32_t nodeId, const String &name, int rssi, const String &address, uint8_t addressType) {
 #if !ENABLE_BLE_MESH
   (void)nodeId; (void)name; (void)rssi; (void)address; (void)addressType;
@@ -240,11 +294,13 @@ void updateBleNode(uint32_t nodeId, const String &name, int rssi, const String &
   if (nodeId == 0 || nodeId == localNodeId) return;
 
   BleNode *slot = nullptr;
+  bool isNewNode = true;
   for (auto &node : bleNodes) {
-    if (node.active && node.nodeId == nodeId) { slot = &node; break; }
+    if (node.active && node.nodeId == nodeId) { slot = &node; isNewNode = false; break; }
     if (!node.active && slot == nullptr) slot = &node;
   }
   if (slot == nullptr) slot = &bleNodes[0];
+  if (slot->active && slot->nodeId != nodeId) isNewNode = true;
 
   slot->active = true;
   slot->nodeId = nodeId;
@@ -255,23 +311,57 @@ void updateBleNode(uint32_t nodeId, const String &name, int rssi, const String &
   slot->lastSeenAt = millis();
   updateRoute(nodeId, nodeId, 1);
   bleLine = "BLE " + nodeIdHex(nodeId).substring(4) + " " + String(rssi) + "dBm";
+  if (isNewNode) {
+    if (!hoppingSynced) {
+      queueBleHelloTo(nodeId, false);
+    }
+  }
 }
 
-// Decode a BLE manufacturer data beacon into node ID and name.
-// Beacon format: ['T','D','M', version{1|2}, 4-byte LE nodeId, name...]
+// Decode an encrypted BLE manufacturer data beacon into node ID, optional FHSS
+// sync, and name. Only the outer marker and nonce seed are plaintext:
+//   ['T','D','E','4', 4-byte nonce seed, AES-CTR(ciphertext...)]
+// Decrypted payload:
+//   [4-byte LE nodeId, state, slot, 4-byte LE networkTime, 6-byte name, crc16]
 // Returns false if the beacon is not a valid T-Deck mesh advertisement.
-bool decodeBleBeaconData(const std::string &data, uint32_t &nodeId, String &name) {
-  if (data.size() < 8 || data[0] != 'T' || data[1] != 'D' || data[2] != 'M' || (data[3] != '1' && data[3] != '2'))
+bool decodeBleBeaconData(const std::string &data, uint32_t &nodeId, String &name,
+                         bool &hasSync, bool &authoritativeSync,
+                         uint8_t &syncSlot, int32_t &syncNetworkTime) {
+  hasSync = false;
+  authoritativeSync = false;
+  syncSlot = 0;
+  syncNetworkTime = 0;
+  if (data.size() != BLE_ADV_TOTAL_LEN || data[0] != 'T' || data[1] != 'D' || data[2] != 'E' || data[3] != '4')
     return false;
-  nodeId = static_cast<uint8_t>(data[4]) |
-           (static_cast<uint32_t>(static_cast<uint8_t>(data[5])) << 8) |
-           (static_cast<uint32_t>(static_cast<uint8_t>(data[6])) << 16) |
-           (static_cast<uint32_t>(static_cast<uint8_t>(data[7])) << 24);
-  name = "";
-  for (size_t j = 8; j < data.size(); ++j) {
-    if (data[j] == 0) break;
-    name += static_cast<char>(data[j]);
+
+  const uint32_t nonceSeed =
+      static_cast<uint32_t>(static_cast<uint8_t>(data[4])) |
+      (static_cast<uint32_t>(static_cast<uint8_t>(data[5])) << 8) |
+      (static_cast<uint32_t>(static_cast<uint8_t>(data[6])) << 16) |
+      (static_cast<uint32_t>(static_cast<uint8_t>(data[7])) << 24);
+  uint8_t cipher[BLE_ADV_PLAIN_LEN];
+  uint8_t plain[BLE_ADV_PLAIN_LEN];
+  memcpy(cipher, data.data() + BLE_ADV_MARKER_LEN + BLE_ADV_NONCE_SEED_LEN, sizeof(cipher));
+  if (!cryptBleAdvPayload(nonceSeed, cipher, plain)) return false;
+
+  const uint16_t expectedCrc = static_cast<uint16_t>(plain[16]) | (static_cast<uint16_t>(plain[17]) << 8);
+  if (crc16Ccitt(plain, 16) != expectedCrc) {
+    memset(plain, 0, sizeof(plain));
+    return false;
   }
+
+  nodeId = readU32(plain, 0);
+  hasSync = true;
+  authoritativeSync = plain[4] == 'S';
+  syncSlot = plain[5];
+  syncNetworkTime = static_cast<int32_t>(readU32(plain, 6));
+  name = "";
+  for (size_t j = 0; j < BLE_ADV_NAME_LEN; ++j) {
+    const char c = static_cast<char>(plain[10 + j]);
+    if (c == 0) break;
+    name += c;
+  }
+  memset(plain, 0, sizeof(plain));
   return nodeId != 0;
 }
 
@@ -282,28 +372,43 @@ void configureBleAdvertisement() {
   bleLine = "BLE disabled";
   return;
 #endif
-  uint8_t manufacturerData[20] = {
-      'T', 'D', 'M', '2',
-      static_cast<uint8_t>(localNodeId & 0xFF),
-      static_cast<uint8_t>((localNodeId >> 8) & 0xFF),
-      static_cast<uint8_t>((localNodeId >> 16) & 0xFF),
-      static_cast<uint8_t>((localNodeId >> 24) & 0xFF)};
-  const String advertisedName = deviceName.substring(0, 12);
-  memcpy(manufacturerData + 8, advertisedName.c_str(), advertisedName.length());
+  uint8_t plain[BLE_ADV_PLAIN_LEN] = {};
+  const int32_t networkTime = hoppingSynced ? static_cast<int32_t>(hopNetworkTime()) : 0;
+  writeU32(plain, 0, localNodeId);
+  plain[4] = hoppingSynced ? 'S' : 'D';
+  plain[5] = hopSlot;
+  writeU32(plain, 6, static_cast<uint32_t>(networkTime));
+  const String advertisedName = deviceName.substring(0, BLE_ADV_NAME_LEN);
+  memcpy(plain + 10, advertisedName.c_str(), advertisedName.length());
+  const uint16_t crc = crc16Ccitt(plain, 16);
+  plain[16] = static_cast<uint8_t>(crc & 0xFF);
+  plain[17] = static_cast<uint8_t>((crc >> 8) & 0xFF);
+
+  uint8_t manufacturerData[BLE_ADV_TOTAL_LEN] = {'T', 'D', 'E', '4'};
+  const uint32_t nonceSeed = esp_random();
+  manufacturerData[4] = static_cast<uint8_t>(nonceSeed & 0xFF);
+  manufacturerData[5] = static_cast<uint8_t>((nonceSeed >> 8) & 0xFF);
+  manufacturerData[6] = static_cast<uint8_t>((nonceSeed >> 16) & 0xFF);
+  manufacturerData[7] = static_cast<uint8_t>((nonceSeed >> 24) & 0xFF);
+  if (!cryptBleAdvPayload(nonceSeed, plain, manufacturerData + BLE_ADV_MARKER_LEN + BLE_ADV_NONCE_SEED_LEN)) {
+    memset(plain, 0, sizeof(plain));
+    bleLine = "BLE adv encrypt failed";
+    return;
+  }
+  memset(plain, 0, sizeof(plain));
 
   NimBLEAdvertisementData advertisement;
-  advertisement.setFlags(0x04);
-  advertisement.addServiceUUID(NimBLEUUID(BLE_MESH_ADV_UUID));
+  advertisement.setFlags(0x06);
   advertisement.setManufacturerData(std::string(reinterpret_cast<char *>(manufacturerData), sizeof(manufacturerData)));
 
   NimBLEAdvertisementData scanResponse;
-  scanResponse.setName(deviceName.c_str());
 
   NimBLEAdvertising *advertising = NimBLEDevice::getAdvertising();
   advertising->stop();
   advertising->setAdvertisementData(advertisement);
   advertising->setScanResponseData(scanResponse);
   advertising->start();
+  lastBleAdvRefreshAt = millis();
   bleReady = true;
   bleLine = "BLE advertising " + nodeIdHex(localNodeId).substring(4);
 }
@@ -327,6 +432,7 @@ void setupBleLocation() {
   NimBLEDevice::init(deviceName.c_str());
   NimBLEDevice::setMTU(185);
   bleServer = NimBLEDevice::createServer();
+  bleServer->setCallbacks(new MeshServerCallbacks());
   NimBLEService *service = bleServer->createService(NimBLEUUID(BLE_MESH_SERVICE_UUID));
   blePacketCharacteristic = service->createCharacteristic(
       NimBLEUUID(BLE_MESH_PACKET_UUID),
@@ -343,6 +449,19 @@ void setupBleLocation() {
   bleScan->setWindow(449);     // 449 * 0.625ms ≈ 281ms scan window
   // Stagger initial scan start to avoid synchronized scanning with peers.
   lastBleScanAt = millis() - BLE_SCAN_INTERVAL_MS + random(0, 3000);
+  if (bleTxTaskHandle == nullptr) {
+    const BaseType_t created = xTaskCreatePinnedToCore(
+        bleTransmitTask,
+        "ble_tx",
+        4096,
+        nullptr,
+        1,
+        &bleTxTaskHandle,
+        0);
+    if (created != pdPASS) {
+      bleLine = "BLE tx worker failed";
+    }
+  }
 }
 
 // Service the periodic BLE scan cycle. Called from loop().
@@ -355,6 +474,9 @@ void serviceBleLocation() {
   const uint32_t now = millis();
   // Don't scan while BLE transmit is busy or pending.
   if (bleTxBusy || bleQueueCount > 0 || now - lastBleTxAt < 1000) return;
+  if (!bleScanInProgress && now - lastBleAdvRefreshAt >= BLE_ADV_REFRESH_MS) {
+    configureBleAdvertisement();
+  }
 
   if (!bleScanInProgress) {
     if (now - lastBleScanAt < BLE_SCAN_INTERVAL_MS) return;
@@ -362,8 +484,13 @@ void serviceBleLocation() {
     bleScanStartedAt = now;
     packetStats.bleScans++;
     bleLine = "BLE scanning";
+    NimBLEDevice::getAdvertising()->stop();
+    vTaskDelay(pdMS_TO_TICKS(10));
     bleScanInProgress = bleScan->start(BLE_SCAN_DURATION_MS, false, true);
-    if (!bleScanInProgress) bleLine = "BLE scan busy";
+    if (!bleScanInProgress) {
+      bleLine = "BLE scan busy";
+      restartBleAdvertisement();
+    }
     return;
   }
 
@@ -373,20 +500,33 @@ void serviceBleLocation() {
   bleScanInProgress = false;
   NimBLEScanResults results = bleScan->getResults();
   bleLine = "BLE scan " + String(results.getCount()) + " adv";
+  uint8_t meshBeaconCount = 0;
   for (int i = 0; i < results.getCount(); ++i) {
     const NimBLEAdvertisedDevice *device = results.getDevice(i);
     if (device == nullptr) continue;
 
     uint32_t nodeId = 0;
     String name = "";
+    bool hasSync = false;
+    bool authoritativeSync = false;
+    uint8_t syncSlot = 0;
+    int32_t syncNetworkTime = 0;
     for (uint8_t dataIndex = 0; dataIndex < device->getManufacturerDataCount(); ++dataIndex) {
-      if (decodeBleBeaconData(device->getManufacturerData(dataIndex), nodeId, name)) break;
+      if (decodeBleBeaconData(device->getManufacturerData(dataIndex), nodeId, name,
+                              hasSync, authoritativeSync, syncSlot, syncNetworkTime)) break;
     }
     if (nodeId == 0) continue;
+    meshBeaconCount++;
     if (device->haveName()) name = String(device->getName().c_str());
     if (name.length() == 0) name = nodeIdHex(nodeId);
     updateBleNode(nodeId, name, device->getRSSI(), String(device->getAddress().toString().c_str()), device->getAddressType());
     packetStats.bleSeen++;
+    if (hasSync && authoritativeSync && !hoppingSynced) {
+      applyHopSync(syncSlot, syncNetworkTime);
+      hoppingSynced = true;
+      lastHopSyncAt = millis();
+      bleLine = "BLE sync " + nodeIdHex(nodeId).substring(4);
+    }
   }
   bleScan->clearResults();
   restartBleAdvertisement();
@@ -394,15 +534,12 @@ void serviceBleLocation() {
 }
 
 // ============================================================================
-//  BLE Link Service — persistent connection pool management
+//  BLE Link Service — cleanup for dormant persistent links
 // ============================================================================
 
-// Service the persistent BLE link pool. Called from loop().
-//  1. Iterates scan result BleNode records and attempts to establish links
-//     for any node not already connected (up to BLE_LINK_POOL_SIZE).
-//  2. Disconnects links that have been idle too long.
-//  3. Reconnects links to nodes still in the scan table but whose
-//     client connection dropped.
+// Service any pre-existing persistent BLE links. Background link establishment
+// is intentionally disabled: repeated proactive NimBLE client connects can trip
+// ble_hs_timer_exp asserts on ESP32. Mesh packets use on-demand writes instead.
 void serviceBleLinks() {
 #if !ENABLE_BLE_MESH
   return;
@@ -417,51 +554,16 @@ void serviceBleLinks() {
   for (auto &link : bleLinks) {
     if (!link.active) continue;
     if (now - link.lastActivityAt >= BLE_LINK_IDLE_TIMEOUT_MS) {
-      appPrintf("[ble] link idle timeout: node=%08lX\n", static_cast<unsigned long>(link.nodeId));
       teardownLink(link);
       continue;
     }
     // Check if the client is still connected (may have dropped)
     if (link.client != nullptr && !link.client->isConnected()) {
-      appPrintf("[ble] link dropped: node=%08lX\n", static_cast<unsigned long>(link.nodeId));
       teardownLink(link);
     }
   }
 
-  // Phase 2: Establish links to newly discovered BLE nodes.
-  // Guard: only one connect operation at a time, and skip nodes that
-  // have been recently torn down (cooldown) to let NimBLE timers settle.
-  // This prevents ble_hs_timer_exp asserts from overlapping operations.
-  if (!bleLinkBusy) {
-    bleLinkBusy = true;
-    for (const auto &node : bleNodes) {
-      if (!node.active) continue;
-      if (now - node.lastSeenAt > BLE_NODE_TTL_MS) continue;
-      if (node.nodeId == localNodeId || node.nodeId == 0) continue;
-      if (node.address.length() == 0) continue;
-
-      // Skip if this node was recently torn down (cooldown)
-      if (isLinkOnCooldown(node.nodeId)) continue;
-
-      // Skip if we already have a link to this node or address
-      if (findLinkByNodeId(node.nodeId) != nullptr) continue;
-      if (findLinkByAddress(node.address) != nullptr) continue;
-
-      // Check if the pool is full
-      BleLink *slot = findEmptyLinkSlot();
-      if (slot == nullptr) break;  // pool is full, stop trying
-
-      appPrintf("[ble] establishing link to node=%08lX addr=%s\n",
-                static_cast<unsigned long>(node.nodeId), node.address.c_str());
-      establishLink(*slot, node.nodeId, node.address, node.addressType);
-      // Only attempt one connection per service cycle to avoid flooding
-      // NimBLE with concurrent operations.
-      break;
-    }
-    bleLinkBusy = false;
-  }
-
-  // Phase 3: Update activity timestamps for still-connected links (keepalive)
+  // Update activity timestamps for still-connected links (keepalive)
   for (auto &link : bleLinks) {
     if (!link.active) continue;
     if (link.client != nullptr && link.client->isConnected()) {
@@ -471,14 +573,14 @@ void serviceBleLinks() {
 }
 
 // ============================================================================
-//  BLE Transmit — send over persistent link, fallback to blocking
+//  BLE Transmit — send over an existing link or on-demand connection
 // ============================================================================
 
 // Send an encoded mesh packet over a persistent BLE link.
 // Returns true if the write succeeded.
 static bool sendOverLink(BleLink &link, const uint8_t *encoded, size_t len) {
   if (link.txChar == nullptr || link.client == nullptr || !link.client->isConnected()) return false;
-  const bool ok = link.txChar->writeValue(encoded, len, false);
+  const bool ok = link.txChar->writeValue(encoded, len, true);
   if (ok) {
     link.lastActivityAt = millis();
     packetStats.bleTx++;
@@ -513,7 +615,7 @@ bool sendBlePacketToBlocking(uint32_t nodeId, const uint8_t *encoded, size_t len
   // Global cooldown: skip if NimBLE timers may still be settling.
   // The caller (processBleTxJob) will return to serviceBleTransmit which
   // will re-queue or retry on the next cycle.
-  if (millis() - lastClientOpAt < BLE_CLIENT_OP_COOLDOWN_MS) return false;
+  if (bleClientOpCoolingDown()) return false;
   if (bleScan != nullptr && bleScan->isScanning()) { bleScan->stop(); bleScanInProgress = false; }
   NimBLEDevice::getAdvertising()->stop();
   vTaskDelay(pdMS_TO_TICKS(20));
@@ -525,10 +627,21 @@ bool sendBlePacketToBlocking(uint32_t nodeId, const uint8_t *encoded, size_t len
 
   bool ok = false;
   if (client->connect(NimBLEAddress(std::string(node.address.c_str()), node.addressType), true, false, false)) {
+    vTaskDelay(pdMS_TO_TICKS(75));
     NimBLERemoteService *service = client->getService(NimBLEUUID(BLE_MESH_SERVICE_UUID));
     if (service != nullptr) {
       NimBLERemoteCharacteristic *characteristic = service->getCharacteristic(NimBLEUUID(BLE_MESH_PACKET_UUID));
-      if (characteristic != nullptr) ok = characteristic->writeValue(encoded, len, false);
+      if (characteristic != nullptr) {
+        // Require an ATT write response. A no-response write followed by an
+        // immediate disconnect can be dropped while still returning success.
+        ok = characteristic->writeValue(encoded, len, true);
+        if (ok) vTaskDelay(pdMS_TO_TICKS(30));
+        else bleLine = "BLE write failed";
+      } else {
+        bleLine = "BLE char missing";
+      }
+    } else {
+      bleLine = "BLE service missing";
     }
     client->disconnect();
     // Do NOT call NimBLEDevice::deleteClient() after a successful connect().
@@ -542,6 +655,7 @@ bool sendBlePacketToBlocking(uint32_t nodeId, const uint8_t *encoded, size_t len
     NimBLEDevice::deleteClient(client);
     lastClientOpAt = millis();
     packetStats.bleConnectFail++;
+    bleLine = "BLE connect failed";
   }
   if (ok) packetStats.bleTx++; else packetStats.bleWriteFail++;
   lastBleTxAt = millis();
@@ -556,6 +670,17 @@ bool enqueueBlePacket(uint32_t target, const uint8_t *encoded, size_t len, uint8
   return false;
 #endif
   if (!bleReady || len == 0 || len > MAX_PACKET_LEN) return false;
+
+  if (target == BROADCAST_NODE) {
+    bool queuedAny = false;
+    const uint32_t now = millis();
+    for (const auto &node : bleNodes) {
+      if (!node.active || node.address.length() == 0 || now - node.lastSeenAt > BLE_NODE_TTL_MS) continue;
+      if (enqueueBlePacket(node.nodeId, encoded, len, type)) queuedAny = true;
+    }
+    if (queuedAny) bleLine = "BLE broadcast queued";
+    return queuedAny;
+  }
 
   portENTER_CRITICAL(&bleQueueMux);
   if (bleQueueCount >= TX_QUEUE_DEPTH) { portEXIT_CRITICAL(&bleQueueMux); bleLine = "BLE queue full"; return false; }
@@ -598,26 +723,16 @@ bool hasBleTargets() {
 }
 
 // Process a BLE transmit job, sending to a specific node or broadcasting to all nearby.
-// Tries persistent links first, falls back to blocking connect→write→disconnect.
-void processBleTxJob(const BleTxJob &job) {
-  if (!job.active) return;
+// Tries an existing link first, then falls back to on-demand connect→write→disconnect.
+bool processBleTxJob(const BleTxJob &job) {
+  if (!job.active) return false;
 
-  if (job.target != BROADCAST_NODE) {
-    // sendBlePacketToBlocking tries persistent link first then falls
-    // back to blocking connect→write→disconnect. This avoids duplicating
-    // the link check logic here.
-    sendBlePacketToBlocking(job.target, job.encoded, job.len);
-    return;
-  }
-
-  // Broadcast: send to all known BLE nodes
-  const uint32_t now = millis();
-  for (const auto &node : bleNodes) {
-    if (!node.active || node.address.length() == 0 || now - node.lastSeenAt > BLE_NODE_TTL_MS) continue;
-    // sendBlePacketToBlocking handles persistent link first, then fallback
-    sendBlePacketToBlocking(node.nodeId, job.encoded, job.len);
-    vTaskDelay(pdMS_TO_TICKS(BLE_TX_SETTLE_MS));
-  }
+  // Broadcast packets are expanded into per-peer jobs by enqueueBlePacket().
+  // Processing only one target here avoids dropping later peers during NimBLE's
+  // post-connect cooldown window.
+  const bool sent = sendBlePacketToBlocking(job.target, job.encoded, job.len);
+  if (sent) noteTx(job.type);
+  return sent;
 }
 
 // Service the BLE transmit queue. Called from loop().
@@ -626,11 +741,17 @@ void serviceBleTransmit() {
   return;
 #endif
   if (bleTxBusy || millis() - lastBleTxAt < BLE_TX_SETTLE_MS) return;
+  if (bleClientOpCoolingDown()) return;
   BleTxJob job;
   if (dequeueBlePacket(job)) {
     bleTxBusy = true;
-    processBleTxJob(job);
+    const bool sent = processBleTxJob(job);
     bleTxBusy = false;
+    const bool packetIsBroadcast = job.len >= 12 && readU32(job.encoded, 8) == BROADCAST_NODE;
+    if (!sent && !packetIsBroadcast && job.target != BROADCAST_NODE && radioStarted) {
+      enqueueLoRaPacket(job.encoded, job.len, job.type);
+      bleLine = "BLE failed; LoRa fallback";
+    }
   }
 }
 
@@ -650,6 +771,8 @@ void handleBlePacket(const uint8_t *buffer, size_t len, const char *peerAddress,
     packet.rssi = 0;
     bleLine = "BLE rx " + nodeIdHex(packet.source).substring(4);
     handleIncoming(packet);
+  } else {
+    bleLine = "BLE decode fail " + String(len) + "B";
   }
 }
 

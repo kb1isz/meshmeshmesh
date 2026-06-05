@@ -138,10 +138,6 @@ void setup() {
   nextMessageId = esp_random();
   if (nextMessageId == 0) nextMessageId = 1;
 
-  appPrintf("Boot identity: efuse=%s node=%s default=%s\n",
-            efuseMacHex().c_str(),
-            nodeIdHex(localNodeId).c_str(),
-            defaultDeviceName().c_str());
 #ifdef BOARD_HELTEC_V3
   appPrintln("Init display...");
 #endif
@@ -166,7 +162,6 @@ void setup() {
   // Restore any stored messages from NVS flash (survive reboot)
   loadStoredMessages();
 
-  appPrintf("Loaded name: %s\n", deviceName.c_str());
 #ifdef BOARD_HELTEC_V3
   appPrintln(ENABLE_BLE_MESH ? "Init BLE..." : "BLE disabled; LoRa-only mode.");
 #endif
@@ -179,14 +174,12 @@ void setup() {
 #if ENABLE_FREQ_HOPPING
   retuneToFrequency(hopChannels[0]);
   hoppingBootSync();
-  appPrintf("Hopping: %u channels from %.1f MHz, synced=%d slot=%u epoch=%ld\n", hopCount, hopChannels[0], hoppingSynced, hopSlot, static_cast<long>(hopEpochOffset));
 #endif
 
   // Read battery once at boot for immediate display
   batteryVoltage = readBatteryVoltage();
   batteryPercent = computeBatteryPercent(batteryVoltage);
   lastBatteryReadAt = millis();
-  appPrintf("[battery] boot: %.2fV %d%%\n", batteryVoltage, static_cast<int>(batteryPercent));
 
   sendHello();
 #ifdef BOARD_HELTEC_V3
@@ -206,7 +199,6 @@ void loop() {
   serviceInput();
   serviceTouch();
   serviceBlePacket();
-  serviceBleTransmit();
   serviceRadio();
   serviceLoRaTransmit();
   serviceGroupAcks();
@@ -239,20 +231,6 @@ void loop() {
     statusLine = "ready " + settingsSummary();
     drawBottom();
   }
-
-#ifdef BOARD_HELTEC_V3
-  if (millis() - lastSerialStatusAt > 15000 && !hasPendingMessages()) {
-    lastSerialStatusAt = millis();
-    appPrintf("[status] node=%08lX radio=%s rx=%lu tx=%lu routes=%u ble=%u %s\n",
-                  static_cast<unsigned long>(localNodeId),
-                  radioStarted ? "ok" : "off",
-                  static_cast<unsigned long>(packetStats.rx),
-                  static_cast<unsigned long>(packetStats.tx),
-                  activeRouteCount(),
-                  activeBleNodeCount(),
-                  statusLine.c_str());
-  }
-#endif
 
   vTaskDelay(pdMS_TO_TICKS(10));
 }

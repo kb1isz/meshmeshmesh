@@ -279,16 +279,20 @@ constexpr uint32_t ROUTE_DISCOVERY_INTERVAL_MS = 5000;  // 5 seconds
 constexpr uint32_t ROUTE_DISCOVERY_TIMEOUT_MS = 30000;  // 30 seconds
 
 // Interval between BLE scans for nearby mesh nodes.
-constexpr uint32_t BLE_SCAN_INTERVAL_MS = 45000;  // 45 seconds
+constexpr uint32_t BLE_SCAN_INTERVAL_MS = 10000;  // 10 seconds
 
 // Duration of each BLE scan window.
-constexpr uint32_t BLE_SCAN_DURATION_MS = 500;
+constexpr uint32_t BLE_SCAN_DURATION_MS = 1500;
+
+// Refresh BLE advertisement payload so FHSS sync metadata stays current.
+constexpr uint32_t BLE_ADV_REFRESH_MS = 1000;
 
 // BLE-discovered nodes expire after this duration without refresh.
 constexpr uint32_t BLE_NODE_TTL_MS = 180000;  // 3 minutes
 
-// BLE connection timeout per remote device.
-constexpr uint32_t BLE_CONNECT_TIMEOUT_MS = 350;
+// BLE connection timeout per remote device. Kept short because BLE transmit
+// retries can fall back to LoRa and should not tie up the BLE worker.
+constexpr uint32_t BLE_CONNECT_TIMEOUT_MS = 750;
 
 // Settle delay between BLE transmissions to multiple nodes.
 constexpr uint32_t BLE_TX_SETTLE_MS = 250;

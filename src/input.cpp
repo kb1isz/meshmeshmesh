@@ -21,7 +21,6 @@ char readKeyboard() {
   Wire.requestFrom(LILYGO_KB_SLAVE_ADDRESS, 1);
   if (!Wire.available()) return 0;
   const char key = static_cast<char>(Wire.read());
-  if (key != 0) appPrintf("keyboard: 0x%02X '%c'\n", static_cast<uint8_t>(key), isPrintable(key) ? key : '.');
   return key;
 #endif
 }

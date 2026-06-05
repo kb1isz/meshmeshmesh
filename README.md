@@ -223,31 +223,37 @@ Disabled by default in the `heltec_v3` build. The `tdeck` build has it enabled.
 
 ### Bluetooth Mesh Transport
 
-BLE mesh transport is currently compiled off with:
+BLE mesh transport is enabled in the default `tdeck` and `heltec_v3` PlatformIO
+environments with:
 
 ```ini
--DENABLE_BLE_MESH=0
+-DENABLE_BLE_MESH=1
 ```
 
-The code is still present for later work, but the default firmware does not initialize NimBLE, advertise, scan, or send packets over BLE. All chat, ACK, route discovery, HELLO, and relay packets use LoRa.
+Set this flag to `0` for a LoRa-only build. In LoRa-only mode the firmware does
+not initialize NimBLE, advertise, scan, or send packets over BLE.
 
-When BLE is re-enabled, this section applies.
-
-Each device advertises a small BLE manufacturer beacon containing:
-- project marker
+Each device advertises a small encrypted BLE manufacturer beacon. Only the
+project marker/version and a nonce seed are plaintext; the shared encryption key
+protects:
 - node id
-- device name
+- FHSS sync state, slot, and network time
+- shortened device name
 
-Every 45 seconds, the device scans briefly for nearby T-Deck beacons. BLE-discovered nodes appear on the mesh dashboard with node id, device name, RSSI, and age.
+Every 10 seconds, the device scans briefly for nearby T-Deck beacons. BLE-discovered nodes appear on the mesh dashboard with node id, device name, RSSI, and age.
 
-BLE-discovered nodes are also added as one-hop routes. The firmware exposes a BLE GATT mesh packet characteristic, so nearby nodes can exchange the same packet format used over LoRa:
+BLE-discovered nodes are also added as one-hop routes. Periodic mesh HELLOs are queued to nearby BLE peers after they have been discovered. The firmware exposes a BLE GATT mesh packet characteristic, so nearby nodes can exchange the same packet format used over LoRa:
 - chat DATA
 - ACK
 - HELLO
 - RREQ
 - RREP
 
-If a packet has a BLE-nearby next hop, the firmware tries BLE first. Broadcast packets are sent to nearby BLE nodes and over LoRa. LoRa remains the long-range fallback; BLE helps nearby nodes exchange traffic faster and with less LoRa airtime.
+If a packet has a BLE-nearby next hop, the firmware tries an on-demand BLE
+connect/write/disconnect first. If the BLE write cannot be completed, the queued
+packet is handed to the LoRa transmitter as a fallback. Broadcast packets are
+sent to nearby BLE nodes and over LoRa. LoRa remains the long-range fallback;
+BLE helps nearby nodes exchange traffic faster and with less LoRa airtime.
 
 ### GPS Position Sharing
 
@@ -304,9 +310,14 @@ If the monitor is blank, make sure you are using the Heltec environment explicit
 pio device monitor -e heltec_v3 --baud 115200
 ```
 
-Press the board `RST` button after opening the monitor. The Heltec build prints boot messages immediately and then a `[status]` line about every 15 seconds.
+Press the board `RST` button after opening the monitor. The Heltec build prints
+brief boot prompts and then stays quiet unless you type a command or send chat.
 
-The Heltec build prints debug/status output to both USB CDC serial and UART0 by default. UART0 input is guarded: it accepts slash commands such as `/settings`, `/freq`, `/bw`, `/name`, and `/key`, but ignores plain non-command lines so floating UART pins cannot accidentally send chat messages. To send a chat message from the UART0 console, use `/send <message>`.
+The Heltec build mirrors command/chat output to both USB CDC serial and UART0 by
+default. UART0 input is guarded: it accepts slash commands such as `/settings`,
+`/freq`, `/bw`, `/name`, and `/key`, but ignores plain non-command lines so
+floating UART pins cannot accidentally send chat messages. To send a chat
+message from the UART0 console, use `/send <message>`.
 
 If upload fails, hold the trackball middle button while plugging in USB to enter download mode.
 

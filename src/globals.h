@@ -204,6 +204,8 @@ bool isDuplicate(uint32_t source, uint32_t messageId);
 void handleIncoming(const Packet &packet);
 void sendRouteRequest(uint32_t target);
 void sendHello();
+void queueBleHelloBroadcast(bool authoritativeSync);
+void queueBleHelloTo(uint32_t target, bool authoritativeSync);
 bool sendHelloImmediate(bool trackSlot = true, bool authoritativeSync = false);
 void queueRelay(const Packet &packet);
 void forwardUnicast(const Packet &packet);
@@ -234,7 +236,7 @@ bool dequeueBlePacket(BleTxJob &job);
 bool hasBleTargets();
 bool findBleNode(uint32_t nodeId, BleNode &out);
 void updateBleNode(uint32_t nodeId, const String &name, int rssi, const String &address, uint8_t addressType);
-void processBleTxJob(const BleTxJob &job);
+bool processBleTxJob(const BleTxJob &job);
 
 void servicePending();
 void serviceRelay();
@@ -450,7 +452,9 @@ String bytesToHex(const uint8_t *data, size_t len);
 bool hexToBytes(const String &hex, uint8_t *out, size_t maxLen, size_t &outLen);
 bool parseNodeId(const String &text, uint32_t &nodeId);
 uint32_t firstDirectNode();
-bool decodeBleBeaconData(const std::string &data, uint32_t &nodeId, String &name);
+bool decodeBleBeaconData(const std::string &data, uint32_t &nodeId, String &name,
+                         bool &hasSync, bool &authoritativeSync,
+                         uint8_t &syncSlot, int32_t &syncNetworkTime);
 
 // New feature globals
 extern FragmentAssembly fragmentAssemblies[4];

@@ -111,7 +111,6 @@ bool applyRadioSettings(bool haltOnFailure) {
   hopIntervalMs = max(static_cast<uint32_t>(2000), airtime * 2);
   hopLastTxSlot = 0xFF;
   hopLastRxSlot = 0xFF;
-  appPrintf("[hop] airtime=%u ms interval=%u ms\n", airtime, hopIntervalMs);
 #if ENABLE_FREQ_HOPPING
   buildHopChannels();
 #endif
@@ -293,7 +292,6 @@ void buildHopChannels() {
   const uint8_t bwKhz = static_cast<uint8_t>(radioSettings.bandwidth);
   const uint8_t channels = static_cast<uint8_t>((HOP_BAND_MAX_MHZ - HOP_BAND_MIN_MHZ) / bwMHz);
   if (channels < 2) {
-    appPrintf("[hop] too few channels (%u) for bw=%.0f kHz\n", channels, radioSettings.bandwidth);
     return;
   }
 
@@ -302,7 +300,6 @@ void buildHopChannels() {
   hopChannels = static_cast<float *>(malloc(channels * sizeof(float)));
   if (hopChannels == nullptr) {
     hopCount = 0;
-    appPrintln("[hop] channel allocation failed");
     return;
   }
   hopCount = channels;
@@ -322,10 +319,6 @@ void buildHopChannels() {
     const float tmp = hopChannels[i]; hopChannels[i] = hopChannels[j]; hopChannels[j] = tmp;
   }
 
-  // Diagnostic: print the hop channel list so it can be compared between devices.
-  appPrintf("[hop] %u channels bw=%u kHz:", hopCount, bwKhz);
-  for (uint8_t i = 0; i < hopCount; ++i) appPrintf(" %.1f", hopChannels[i]);
-  appPrintln();
 }
 
 // Compute the synchronized network time (local millis() corrected by epoch offset).
@@ -373,7 +366,6 @@ extern uint32_t lastHopSyncAt;
 // nothing and only causes drift.
 void applyHopSync(uint8_t remoteSlot, int32_t remoteNetworkTime) {
   if (hopChannels == nullptr || hopCount == 0) return;
-  const int32_t oldOffset = hopEpochOffset;
   hopEpochOffset = remoteNetworkTime - static_cast<int32_t>(millis());
   // Snap hopSlot to current network time, but do NOT retune or set
   // hoppingSynced here. The caller decides when to mark us as synced.
@@ -381,16 +373,7 @@ void applyHopSync(uint8_t remoteSlot, int32_t remoteNetworkTime) {
   // stop the sweep — another HELLO or the sweep conclusion will lock it in.
   const int32_t nt = hopNetworkTime();
   hopSlot = hopNetworkSlot(nt);
-  // Diagnostic: show the sync event.
-  appPrintf("[hop] sync slot=%u remoteNT=%ld localMs=%lu epo=%ld (was %ld) nt=%ld -> slot=%u freq=%.1f\n",
-    static_cast<unsigned int>(remoteSlot),
-    static_cast<long>(remoteNetworkTime),
-    static_cast<unsigned long>(millis()),
-    static_cast<long>(hopEpochOffset),
-    static_cast<long>(oldOffset),
-    static_cast<long>(nt),
-    static_cast<unsigned int>(hopSlot),
-    hopChannels[hopSlot]);
+  (void)remoteSlot;
 }
 
 // Tune radio to a specific frequency. Returns false if the radio is busy
@@ -424,7 +407,6 @@ bool retuneToFrequency(float freq) {
 //    immediately broadcast an authoritative SYNC HELLO for other waiting nodes.
 void hoppingBootSync() {
   if (!radioStarted || hopChannels == nullptr || hopCount == 0) return;
-  appPrintln("Hopping: rendezvous on ch0...");
   const float rendezvousFreq = hopChannels[0];
   if (!retuneToFrequency(rendezvousFreq)) return;
   radio.startReceive();
@@ -432,6 +414,9 @@ void hoppingBootSync() {
   const uint32_t scanStart = millis();
 
   while (!hoppingSynced) {
+    serviceBlePacket();
+    serviceBleLocation();
+
     if (millis() - scanStart >= HOP_RENDEZVOUS_TIMEOUT_MS) {
       hopSlot = 0;
       hopEpochOffset = -static_cast<int32_t>(millis());
@@ -440,27 +425,15 @@ void hoppingBootSync() {
       retuneToFrequency(hopChannels[0]);
       statusLine = "FHSS cold start";
       drawBottom();
-      appPrintf("[hop] cold-start epoch after %lu ms slot=%u epo=%ld\n",
-                static_cast<unsigned long>(millis() - scanStart),
-                static_cast<unsigned int>(hopSlot),
-                static_cast<long>(hopEpochOffset));
       sendHelloImmediate(false, true);
       break;
-    }
-
-    // DEBUG: log TX cycle
-    {
-      const uint32_t elapsed = millis() - scanStart;
-      appPrintf("[dbg] BOOT TX cycle %lu s onto ch0 (txLast=%u rxLast=%u slot=%u hopInt=%lu)\n",
-                static_cast<unsigned long>(elapsed / 1000),
-                hopLastTxSlot, hopLastRxSlot, hopSlot,
-                static_cast<unsigned long>(hopIntervalMs));
     }
 
     // Transmit discovery HELLO first.
     statusLine = "FHSS ch0 TX " + String((millis() - scanStart) / 1000) + "s";
     drawBottom();
     sendHelloImmediate(true, false);
+    queueBleHelloBroadcast(false);
 
     // Then listen for a full hop interval. The reply from a synced device
     // will arrive within the airtime (~350ms @ SF10/125kHz) plus 0-50ms
@@ -471,20 +444,12 @@ void hoppingBootSync() {
     const uint32_t listenDeadline = millis() + hopIntervalMs;
     while (millis() < listenDeadline && !hoppingSynced) {
       serviceRadio();
+      serviceBlePacket();
+      serviceBleLocation();
       delay(5);
-    }
-    // DEBUG: log listen end
-    if (!hoppingSynced) {
-      appPrintf("[dbg] BOOT listen ended, no sync yet (%lu s elapsed)\n",
-                static_cast<unsigned long>((millis() - scanStart) / 1000));
     }
   }
 
-  appPrintf("[hop] synced slot=%u nt=%ld epo=%ld after %lu ms\n",
-            static_cast<unsigned int>(hopSlot),
-            static_cast<long>(hopNetworkTime()),
-            static_cast<long>(hopEpochOffset),
-            millis() - scanStart);
   lastHopSyncAt = millis();
   statusLine = "FHSS synced slot " + String(hopSlot + 1);
   drawBottom();
@@ -524,11 +489,4 @@ void serviceHopping() {
   } else {
     retuneToFrequency(hopChannels[hopSlot]);
   }
-
-  // Diagnostic: print every normal hop.
-  appPrintf("[hop] HOP slot=%u freq=%.1f ms=%lu nt=%ld epo=%ld\n",
-    static_cast<unsigned int>(hopSlot), hopChannels[hopSlot],
-    static_cast<unsigned long>(millis()),
-    static_cast<long>(nt),
-    static_cast<long>(hopEpochOffset));
 }

@@ -357,7 +357,6 @@ void serviceBattery() {
   lastBatteryReadAt = now;
   batteryVoltage = readBatteryVoltage();
   batteryPercent = computeBatteryPercent(batteryVoltage);
-  appPrintf("[battery] %.2fV %d%%\n", batteryVoltage, static_cast<int>(batteryPercent));
 }
 
 // Check if a message has already been seen (deduplication).
