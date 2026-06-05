@@ -86,7 +86,7 @@ static TaskHandle_t bleTxTaskHandle = nullptr;
 
 constexpr size_t BLE_ADV_MARKER_LEN = 4;
 constexpr size_t BLE_ADV_NONCE_SEED_LEN = 4;
-constexpr size_t BLE_ADV_PLAIN_LEN = 18;
+constexpr size_t BLE_ADV_PLAIN_LEN = 20;
 constexpr size_t BLE_ADV_NAME_LEN = 6;
 constexpr size_t BLE_ADV_TOTAL_LEN = BLE_ADV_MARKER_LEN + BLE_ADV_NONCE_SEED_LEN + BLE_ADV_PLAIN_LEN;
 
@@ -322,15 +322,18 @@ void updateBleNode(uint32_t nodeId, const String &name, int rssi, const String &
 // sync, and name. Only the outer marker and nonce seed are plaintext:
 //   ['T','D','E','4', 4-byte nonce seed, AES-CTR(ciphertext...)]
 // Decrypted payload:
-//   [4-byte LE nodeId, state, slot, 4-byte LE networkTime, 6-byte name, crc16]
+//   [4-byte LE nodeId, state, slot, 4-byte LE networkTime,
+//    2-byte radio settings fingerprint, 6-byte name, crc16]
 // Returns false if the beacon is not a valid T-Deck mesh advertisement.
 bool decodeBleBeaconData(const std::string &data, uint32_t &nodeId, String &name,
                          bool &hasSync, bool &authoritativeSync,
-                         uint8_t &syncSlot, int32_t &syncNetworkTime) {
+                         uint8_t &syncSlot, int32_t &syncNetworkTime,
+                         bool &syncCompatible) {
   hasSync = false;
   authoritativeSync = false;
   syncSlot = 0;
   syncNetworkTime = 0;
+  syncCompatible = false;
   if (data.size() != BLE_ADV_TOTAL_LEN || data[0] != 'T' || data[1] != 'D' || data[2] != 'E' || data[3] != '4')
     return false;
 
@@ -344,8 +347,8 @@ bool decodeBleBeaconData(const std::string &data, uint32_t &nodeId, String &name
   memcpy(cipher, data.data() + BLE_ADV_MARKER_LEN + BLE_ADV_NONCE_SEED_LEN, sizeof(cipher));
   if (!cryptBleAdvPayload(nonceSeed, cipher, plain)) return false;
 
-  const uint16_t expectedCrc = static_cast<uint16_t>(plain[16]) | (static_cast<uint16_t>(plain[17]) << 8);
-  if (crc16Ccitt(plain, 16) != expectedCrc) {
+  const uint16_t expectedCrc = static_cast<uint16_t>(plain[18]) | (static_cast<uint16_t>(plain[19]) << 8);
+  if (crc16Ccitt(plain, 18) != expectedCrc) {
     memset(plain, 0, sizeof(plain));
     return false;
   }
@@ -355,9 +358,12 @@ bool decodeBleBeaconData(const std::string &data, uint32_t &nodeId, String &name
   authoritativeSync = plain[4] == 'S';
   syncSlot = plain[5];
   syncNetworkTime = static_cast<int32_t>(readU32(plain, 6));
+  const uint16_t remoteSettings =
+      static_cast<uint16_t>(plain[10]) | (static_cast<uint16_t>(plain[11]) << 8);
+  syncCompatible = remoteSettings == radioSettingsFingerprint();
   name = "";
   for (size_t j = 0; j < BLE_ADV_NAME_LEN; ++j) {
-    const char c = static_cast<char>(plain[10 + j]);
+    const char c = static_cast<char>(plain[12 + j]);
     if (c == 0) break;
     name += c;
   }
@@ -378,11 +384,14 @@ void configureBleAdvertisement() {
   plain[4] = hoppingSynced ? 'S' : 'D';
   plain[5] = hopSlot;
   writeU32(plain, 6, static_cast<uint32_t>(networkTime));
+  const uint16_t settingsHash = radioSettingsFingerprint();
+  plain[10] = static_cast<uint8_t>(settingsHash & 0xFF);
+  plain[11] = static_cast<uint8_t>(settingsHash >> 8);
   const String advertisedName = deviceName.substring(0, BLE_ADV_NAME_LEN);
-  memcpy(plain + 10, advertisedName.c_str(), advertisedName.length());
-  const uint16_t crc = crc16Ccitt(plain, 16);
-  plain[16] = static_cast<uint8_t>(crc & 0xFF);
-  plain[17] = static_cast<uint8_t>((crc >> 8) & 0xFF);
+  memcpy(plain + 12, advertisedName.c_str(), advertisedName.length());
+  const uint16_t crc = crc16Ccitt(plain, 18);
+  plain[18] = static_cast<uint8_t>(crc & 0xFF);
+  plain[19] = static_cast<uint8_t>((crc >> 8) & 0xFF);
 
   uint8_t manufacturerData[BLE_ADV_TOTAL_LEN] = {'T', 'D', 'E', '4'};
   const uint32_t nonceSeed = esp_random();
@@ -511,9 +520,11 @@ void serviceBleLocation() {
     bool authoritativeSync = false;
     uint8_t syncSlot = 0;
     int32_t syncNetworkTime = 0;
+    bool syncCompatible = false;
     for (uint8_t dataIndex = 0; dataIndex < device->getManufacturerDataCount(); ++dataIndex) {
       if (decodeBleBeaconData(device->getManufacturerData(dataIndex), nodeId, name,
-                              hasSync, authoritativeSync, syncSlot, syncNetworkTime)) break;
+                              hasSync, authoritativeSync, syncSlot, syncNetworkTime,
+                              syncCompatible)) break;
     }
     if (nodeId == 0) continue;
     meshBeaconCount++;
@@ -521,10 +532,16 @@ void serviceBleLocation() {
     if (name.length() == 0) name = nodeIdHex(nodeId);
     updateBleNode(nodeId, name, device->getRSSI(), String(device->getAddress().toString().c_str()), device->getAddressType());
     packetStats.bleSeen++;
-    if (hasSync && authoritativeSync && !hoppingSynced) {
+    if (hasSync && authoritativeSync && syncCompatible && !hoppingSynced) {
       applyHopSync(syncSlot, syncNetworkTime);
       hoppingSynced = true;
       lastHopSyncAt = millis();
+      // BLE sync updates FHSS timing, but the LoRa radio may still be parked on
+      // the rendezvous channel during boot. Retune immediately so the physical
+      // radio follows the slot we just accepted.
+      if (radioStarted && hopChannels != nullptr && hopCount > 0) {
+        retuneToFrequency(hopChannels[hopSlot]);
+      }
       bleLine = "BLE sync " + nodeIdHex(nodeId).substring(4);
     }
   }

@@ -451,6 +451,11 @@ void hoppingBootSync() {
   }
 
   lastHopSyncAt = millis();
+  // If BLE provided the sync while this routine was listening on the
+  // rendezvous channel, the timing model is current but the SX1262 may still
+  // be tuned to channel 0. Align the radio with the accepted FHSS slot before
+  // returning to the main loop.
+  retuneToFrequency(hopChannels[hopSlot]);
   statusLine = "FHSS synced slot " + String(hopSlot + 1);
   drawBottom();
 }

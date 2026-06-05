@@ -238,9 +238,10 @@ project marker/version and a nonce seed are plaintext; the shared encryption key
 protects:
 - node id
 - FHSS sync state, slot, and network time
+- radio settings fingerprint used to reject incompatible FHSS sync
 - shortened device name
 
-Every 10 seconds, the device scans briefly for nearby T-Deck beacons. BLE-discovered nodes appear on the mesh dashboard with node id, device name, RSSI, and age.
+Every 20 seconds, the device scans briefly for nearby T-Deck beacons. BLE-discovered nodes appear on the mesh dashboard with node id, device name, RSSI, and age.
 
 BLE-discovered nodes are also added as one-hop routes. Periodic mesh HELLOs are queued to nearby BLE peers after they have been discovered. The firmware exposes a BLE GATT mesh packet characteristic, so nearby nodes can exchange the same packet format used over LoRa:
 - chat DATA

@@ -279,10 +279,10 @@ constexpr uint32_t ROUTE_DISCOVERY_INTERVAL_MS = 5000;  // 5 seconds
 constexpr uint32_t ROUTE_DISCOVERY_TIMEOUT_MS = 30000;  // 30 seconds
 
 // Interval between BLE scans for nearby mesh nodes.
-constexpr uint32_t BLE_SCAN_INTERVAL_MS = 10000;  // 10 seconds
+constexpr uint32_t BLE_SCAN_INTERVAL_MS = 20000;  // 20 seconds
 
 // Duration of each BLE scan window.
-constexpr uint32_t BLE_SCAN_DURATION_MS = 1500;
+constexpr uint32_t BLE_SCAN_DURATION_MS = 750;
 
 // Refresh BLE advertisement payload so FHSS sync metadata stays current.
 constexpr uint32_t BLE_ADV_REFRESH_MS = 1000;

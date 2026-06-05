@@ -66,6 +66,31 @@ String settingsSummary() {
          " pwr" + String(radioSettings.txPower);
 }
 
+uint16_t radioSettingsFingerprint() {
+  uint8_t payload[16];
+  const uint16_t frequency10 = static_cast<uint16_t>(radioSettings.frequency * 10.0f + 0.5f);
+  const uint16_t bandwidth10 = static_cast<uint16_t>(radioSettings.bandwidth * 10.0f + 0.5f);
+  const uint16_t hopMin10 = static_cast<uint16_t>(HOP_BAND_MIN_MHZ * 10.0f + 0.5f);
+  const uint16_t hopMax10 = static_cast<uint16_t>(HOP_BAND_MAX_MHZ * 10.0f + 0.5f);
+  payload[0] = static_cast<uint8_t>(frequency10 & 0xFF);
+  payload[1] = static_cast<uint8_t>(frequency10 >> 8);
+  payload[2] = static_cast<uint8_t>(bandwidth10 & 0xFF);
+  payload[3] = static_cast<uint8_t>(bandwidth10 >> 8);
+  payload[4] = radioSettings.spreadingFactor;
+  payload[5] = radioSettings.codingRate;
+  payload[6] = LORA_SYNC_WORD;
+  payload[7] = ENABLE_FREQ_HOPPING ? 1 : 0;
+  payload[8] = static_cast<uint8_t>(hopMin10 & 0xFF);
+  payload[9] = static_cast<uint8_t>(hopMin10 >> 8);
+  payload[10] = static_cast<uint8_t>(hopMax10 & 0xFF);
+  payload[11] = static_cast<uint8_t>(hopMax10 >> 8);
+  payload[12] = hopCount;
+  payload[13] = 0;
+  payload[14] = 0;
+  payload[15] = 0;
+  return crc16Ccitt(payload, sizeof(payload));
+}
+
 // Generate the default device name from the node ID.
 String defaultDeviceName() {
   return "Node-" + nodeIdHex(localNodeId);

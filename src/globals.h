@@ -172,6 +172,7 @@ String directChatLabel();
 String nodeDisplayName(uint32_t nodeId);
 String settingsSummary();
 String defaultDeviceName();
+uint16_t radioSettingsFingerprint();
 bool hasPendingMessages();
 void updateRoute(uint32_t destination, uint32_t nextHop, uint8_t hops);
 bool findRoute(uint32_t destination, RouteEntry &out);
@@ -454,7 +455,8 @@ bool parseNodeId(const String &text, uint32_t &nodeId);
 uint32_t firstDirectNode();
 bool decodeBleBeaconData(const std::string &data, uint32_t &nodeId, String &name,
                          bool &hasSync, bool &authoritativeSync,
-                         uint8_t &syncSlot, int32_t &syncNetworkTime);
+                         uint8_t &syncSlot, int32_t &syncNetworkTime,
+                         bool &syncCompatible);
 
 // New feature globals
 extern FragmentAssembly fragmentAssemblies[4];
