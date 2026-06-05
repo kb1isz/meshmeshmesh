@@ -59,6 +59,12 @@ static bool bleLinkBusy = false;
 // This avoids `ble_hs_timer_exp` asserts from overlapping client operations.
 #define BLE_LINK_COOLDOWN_MS 10000
 #define BLE_LINK_COOLDOWN_SLOTS 4
+
+// Global client-operation guard — after any NimBLE client create/connect/disconnect,
+// wait this long before creating another client. This prevents ble_hs_timer_exp
+// asserts from stale timer handles in the NimBLE soft device.
+#define BLE_CLIENT_OP_COOLDOWN_MS 2000
+static uint32_t lastClientOpAt = 0;
 static uint32_t linkCooldownNode[BLE_LINK_COOLDOWN_SLOTS] = {0};
 static uint32_t linkCooldownUntil[BLE_LINK_COOLDOWN_SLOTS] = {0};
 static uint8_t linkCooldownNext = 0;
@@ -120,6 +126,7 @@ static void teardownLink(BleLink &link) {
     // Give NimBLE time to process the disconnect and destroy internal
     // timer handles before we might create a new client.
     vTaskDelay(pdMS_TO_TICKS(100));
+    lastClientOpAt = millis();
     link.client = nullptr;
   }
   recordLinkCooldown(link.nodeId);
@@ -137,14 +144,22 @@ static void teardownLink(BleLink &link) {
 // Places the connected link into the pool on success.
 // Returns true if the link was established.
 static bool establishLink(BleLink &link, uint32_t nodeId, const String &addr, uint8_t addrType) {
+  // Global cooldown: skip this attempt if NimBLE timers may still be settling
+  // from a previous client operation. The caller (serviceBleLinks) will retry
+  // on the next service cycle (2 seconds).
+  if (millis() - lastClientOpAt < BLE_CLIENT_OP_COOLDOWN_MS) return false;
+
   NimBLEClient *client = NimBLEDevice::createClient();
   if (client == nullptr) return false;
+  lastClientOpAt = millis();
 
   client->setConnectTimeout(BLE_CONNECT_TIMEOUT_MS);
 
   if (!client->connect(NimBLEAddress(std::string(addr.c_str()), addrType), true, false, false)) {
     // connect() never completed — no timer handles pending, safe to delete
+    recordLinkCooldown(nodeId);
     NimBLEDevice::deleteClient(client);
+    lastClientOpAt = millis();
     packetStats.bleConnectFail++;
     return false;
   }
@@ -162,6 +177,8 @@ static bool establishLink(BleLink &link, uint32_t nodeId, const String &addr, ui
   NimBLERemoteService *service = client->getService(NimBLEUUID(BLE_MESH_SERVICE_UUID));
   if (service == nullptr) {
     client->disconnect();
+    recordLinkCooldown(nodeId);
+    lastClientOpAt = millis();
     packetStats.bleConnectFail++;
     return false;
   }
@@ -169,6 +186,8 @@ static bool establishLink(BleLink &link, uint32_t nodeId, const String &addr, ui
   NimBLERemoteCharacteristic *txChar = service->getCharacteristic(NimBLEUUID(BLE_MESH_PACKET_UUID));
   if (txChar == nullptr) {
     client->disconnect();
+    recordLinkCooldown(nodeId);
+    lastClientOpAt = millis();
     packetStats.bleConnectFail++;
     return false;
   }
@@ -490,13 +509,18 @@ bool sendBlePacketToBlocking(uint32_t nodeId, const uint8_t *encoded, size_t len
     teardownLink(*link);
   }
 
-  // No persistent link — do connect→write→disconnect
+  // No persistent link — do connect→write→disconnect.
+  // Global cooldown: skip if NimBLE timers may still be settling.
+  // The caller (processBleTxJob) will return to serviceBleTransmit which
+  // will re-queue or retry on the next cycle.
+  if (millis() - lastClientOpAt < BLE_CLIENT_OP_COOLDOWN_MS) return false;
   if (bleScan != nullptr && bleScan->isScanning()) { bleScan->stop(); bleScanInProgress = false; }
   NimBLEDevice::getAdvertising()->stop();
   vTaskDelay(pdMS_TO_TICKS(20));
 
   NimBLEClient *client = NimBLEDevice::createClient();
-  if (client == nullptr) { restartBleAdvertisement(); return false; }
+  if (client == nullptr) { lastClientOpAt = millis(); restartBleAdvertisement(); return false; }
+  lastClientOpAt = millis();
   client->setConnectTimeout(BLE_CONNECT_TIMEOUT_MS);
 
   bool ok = false;
@@ -512,9 +536,11 @@ bool sendBlePacketToBlocking(uint32_t nodeId, const uint8_t *encoded, size_t len
     // deleting the client causes ble_hs_timer_exp asserts. Just disconnect
     // and let NimBLE clean up the client internally.
     vTaskDelay(pdMS_TO_TICKS(100));
+    lastClientOpAt = millis();
   } else {
     // connect() never completed — no timer handles pending, safe to delete
     NimBLEDevice::deleteClient(client);
+    lastClientOpAt = millis();
     packetStats.bleConnectFail++;
   }
   if (ok) packetStats.bleTx++; else packetStats.bleWriteFail++;
